@@ -28,13 +28,33 @@ skate-data = { path = "crates/skate-data" }
 [profile.dev]
 opt-level = 3
 
+# Release: OOM-sicher für 7 GB GitHub-Runner.
+#
+# lto = "thin" statt true (fat):
+#   - ~50 % weniger RAM beim Link, ~40 % schneller
+#   - ~95 % der Laufzeit-Performance von fat LTO
+#
+# codegen-units = 4 statt 1:
+#   - pro Crate ~4x weniger Peak-RAM in LLVM
+#   - cross-unit-Inlining wird durch lto="thin" wieder hereingeholt
+#
+# package."*" (Dependencies, nicht Workspace-Crates):
+#   - opt-level = 2: bevy/wgpu brauchen kein 3, das ist GPU-bound
+#   - codegen-units = 16: Standard, schnell, wenig RAM
+#
+# Workspace-Crates (skate-*) bleiben bei opt-level = 3 für Game-Logik,
+# Physik, VM, Decompression.
 [profile.release]
 debug = 1
 strip = false
-lto = true
+lto = "thin"
 opt-level = 3
-codegen-units = 1
+codegen-units = 4
 panic = "abort"
+
+[profile.release.package."*"]
+opt-level = 2
+codegen-units = 16
 
 [profile.dev.package."*"]
 opt-level = 3
