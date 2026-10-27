@@ -65,7 +65,7 @@ jobs:
         run: |
           set -euo pipefail
           for f in rust-toolchain rust-toolchain.toml; do
-            [ -f "$f" ] && mv "$f" "$f.disabled-for-aarch64" || true
+            if [ -f "$f" ]; then mv "$f" "$f.disabled-for-aarch64"; fi
           done
 
       - name: aarch64 Multiarch
@@ -92,73 +92,58 @@ jobs:
             libdrm-dev:arm64 libgbm-dev:arm64 \
             libegl-dev:arm64 libgles2-mesa-dev:arm64
           python3 --version
+          git --version
 
-      - name: wgpu v27.0.1 klonen und Mali-G31-Patch
-        run: |
-          set -euo pipefail
-          rm -rf vendor/wgpu
-          git clone --depth 1 --branch v27.0.1 \
-            https://github.com/gfx-rs/wgpu.git vendor/wgpu
-          ADAPTER="vendor/wgpu/wgpu-hal/src/gles/adapter.rs"
-          [ -f "$ADAPTER" ] || { echo "::error::$ADAPTER fehlt"; exit 1; }
-
-          cat > /tmp/patch_wgpu.py <<'PYEOF'
-          import re, sys
-          path = "vendor/wgpu/wgpu-hal/src/gles/adapter.rs"
-          text = open(path).read()
-          if "Mali-G31 R36S-Fix" in text:
-              print("OK: bereits gepatcht"); sys.exit(0)
-          pattern = re.compile(
-              r'let\s+max_storage_buffers_per_shader_stage\s*=\s*'
-              r'if\s+vertex_shader_storage_blocks\s*==\s*0\s*\{'
-              r'\s*fragment_shader_storage_blocks\s*\}'
-              r'\s*else\s*\{'
-              r'\s*vertex_shader_storage_blocks\.min\(fragment_shader_storage_blocks\)\s*\}'
-              r'\s*;', re.DOTALL)
-          replacement = (
-              "let max_storage_buffers_per_shader_stage = if vertex_shader_storage_blocks == 0 {\n"
-              "            if vertex_ssbo_false_zero {\n"
-              "                fragment_shader_storage_blocks\n"
-              "            } else {\n"
-              "                0 // Mali-G31 R36S-Fix\n"
-              "            }\n"
-              "        } else {\n"
-              "            vertex_shader_storage_blocks.min(fragment_shader_storage_blocks)\n"
-              "        };")
-          new, n = pattern.subn(replacement, text, count=1)
-          if n == 0:
-              print("FEHLER: Muster nicht gefunden", file=sys.stderr)
-              for i, l in enumerate(text.splitlines(), 1):
-                  if "max_storage_buffers_per_shader_stage" in l:
-                      print(f"  Zeile {i}: {l!r}", file=sys.stderr)
-              sys.exit(1)
-          open(path, "w").write(new)
-          print("OK: gepatcht")
-          PYEOF
-          python3 /tmp/patch_wgpu.py
-          grep -n "Mali-G31 R36S-Fix" "$ADAPTER"
-
-      - name: Prepare (aarch64-prepare.py)
+      - name: Prepare-Skript vorhanden?
         run: |
           set -euo pipefail
           if [ ! -f tools/aarch64-prepare.py ]; then
             echo "::error::tools/aarch64-prepare.py fehlt im Repo"
             exit 1
           fi
-          python3 tools/aarch64-prepare.py
+          echo "OK: tools/aarch64-prepare.py vorhanden"
+          python3 --version
 
-      - name: Struktur pruefen
+      - name: wgpu v27.0.1 klonen
         run: |
           set -euo pipefail
-          MISSING=0
+          rm -rf vendor/wgpu
+          git clone --depth 1 --branch v27.0.1 \
+            https://github.com/gfx-rs/wgpu.git vendor/wgpu
+          test -f vendor/wgpu/wgpu-hal/src/gles/adapter.rs \
+            || { echo "::error::wgpu-hal/adapter.rs nicht geklont"; exit 1; }
+          test -f vendor/wgpu/Cargo.toml \
+            || { echo "::error::wgpu/Cargo.toml nicht geklont"; exit 1; }
+          echo "OK: wgpu v27.0.1 geklont"
+
+      - name: Prepare (alle Patches)
+        run: |
+          set -euo pipefail
+          python3 tools/aarch64-prepare.py
+          echo ""
+          echo "== Verifikation nach Prepare =="
           for f in .cargo/config.toml \
                    crates/skate-game/src/fb0_writer.rs \
                    crates/skate-game/src/headless_plugin.rs \
-                   portmaster/Skate3.sh portmaster/port.json \
-                   portmaster/README.md portmaster/gameinfo.xml; do
-            if [ -f "$f" ]; then echo "  OK: $f"; else echo "  FEHLT: $f"; MISSING=1; fi
+                   portmaster/Skate3.sh \
+                   portmaster/port.json \
+                   portmaster/README.md \
+                   portmaster/gameinfo.xml; do
+            if [ -f "$f" ]; then
+              echo "  OK: $f"
+            else
+              echo "  FEHLT: $f"
+              exit 1
+            fi
           done
-          [ "$MISSING" -eq 0 ] || exit 1
+          echo ""
+          echo "== wgpu-hal SSBO-Patch verifiziert =="
+          grep -q "Mali-G31 R36S-Fix" vendor/wgpu/wgpu-hal/src/gles/adapter.rs \
+            || { echo "::error::SSBO-Patch fehlt"; exit 1; }
+          echo "  OK"
+          echo ""
+          echo "== wgpu workspace.package =="
+          grep -A20 '^\[workspace.package\]' vendor/wgpu/Cargo.toml | head -20
 
       - name: Cargo Build
         run: |
@@ -170,15 +155,19 @@ jobs:
         run: |
           set -euo pipefail
           BIN=target/aarch64-unknown-linux-gnu/release/skate3rust
-          [ -x "$BIN" ] || { echo "::error::$BIN fehlt"; exit 1; }
+          if [ ! -x "$BIN" ]; then
+            echo "::error::$BIN fehlt"
+            exit 1
+          fi
           file "$BIN"
           MAX=$(aarch64-linux-gnu-objdump -T "$BIN" \
             | { grep -oE 'GLIBC_[0-9][0-9.]*' || true; } \
             | sed 's/^GLIBC_//' | sort -Vu | tail -1)
-          echo "GLIBC: ${MAX:-keine}"
+          echo "Hoechste GLIBC-Version: ${MAX:-keine}"
           if [ -n "$MAX" ] && \
              [ "$(printf '%s\n%s\n' "$MAX_GLIBC" "$MAX" | sort -V | tail -1)" != "$MAX_GLIBC" ]; then
-            echo "::error::Braucht GLIBC_$MAX, ArkOS hat $MAX_GLIBC"; exit 1
+            echo "::error::Braucht GLIBC_$MAX, ArkOS hat nur $MAX_GLIBC"
+            exit 1
           fi
 
       - name: PortMaster-Paket vorbereiten
@@ -189,18 +178,33 @@ jobs:
           PORT_DIR="$STAGE/$PORT_NAME"
           rm -rf "$STAGE"
           mkdir -p "$PORT_DIR/$PORT_NAME/assets"
+
           BIN="target/aarch64-unknown-linux-gnu/release/skate3rust"
           if [ -x "$BIN" ]; then
             install -m 755 "$BIN" "$PORT_DIR/$PORT_NAME/skate3"
             strip --strip-unneeded "$PORT_DIR/$PORT_NAME/skate3" 2>/dev/null || true
+            echo "Binary installiert: $PORT_DIR/$PORT_NAME/skate3"
+          else
+            echo "::warning::skate3rust-Binary fehlt, Paket ohne Binary"
           fi
+
           touch "$PORT_DIR/$PORT_NAME/assets/.gitkeep"
-          cp portmaster/Skate3.sh portmaster/port.json \
-             portmaster/README.md portmaster/gameinfo.xml "$PORT_DIR/" 2>/dev/null || true
+
+          cp portmaster/Skate3.sh    "$PORT_DIR/" 2>/dev/null || true
+          cp portmaster/port.json    "$PORT_DIR/" 2>/dev/null || true
+          cp portmaster/README.md    "$PORT_DIR/" 2>/dev/null || true
+          cp portmaster/gameinfo.xml "$PORT_DIR/" 2>/dev/null || true
           chmod 755 "$PORT_DIR/Skate3.sh" 2>/dev/null || true
+
+          # 640x480 schwarzes JPEG (PortMaster-Anforderung)
           convert -size 640x480 xc:black -gravity center -fill white \
                   -pointsize 48 -annotate 0 "Skate 3" \
-                  "$PORT_DIR/screenshot.jpg" 2>/dev/null || true
+                  "$PORT_DIR/screenshot.jpg" 2>/dev/null || \
+            convert -size 640x480 xc:black "$PORT_DIR/screenshot.jpg" 2>/dev/null || true
+
+          echo ""
+          echo "== dist/ =="
+          find "$STAGE" -type f -o -type d | sort
 
       - name: patched-sources Artifact
         if: always()
@@ -218,13 +222,20 @@ jobs:
             portmaster/
           if-no-files-found: warn
 
-      - name: ZIP
+      - name: PortMaster ZIP
         if: always()
         run: |
           set -euo pipefail
           cd "$GITHUB_WORKSPACE/dist"
-          zip -r skate3.zip "$PORT_NAME"
-          unzip -l skate3.zip || true
+          if [ -d "$PORT_NAME" ]; then
+            zip -r "skate3.zip" "$PORT_NAME"
+            echo "== ZIP-Inhalt =="
+            unzip -l skate3.zip || true
+            echo ""
+            ls -lah skate3.zip
+          else
+            echo "::warning::Kein dist/$PORT_NAME – ZIP uebersprungen"
+          fi
 
       - name: PortMaster Artifact
         if: always()
@@ -233,6 +244,7 @@ jobs:
           name: skate3-portmaster
           path: dist/skate3.zip
           if-no-files-found: warn
+          retention-days: 30
 
       - name: Build-Log Artifact
         if: always()
@@ -241,3 +253,4 @@ jobs:
           name: skate3-build-log
           path: build.log
           if-no-files-found: warn
+          retention-days: 14
