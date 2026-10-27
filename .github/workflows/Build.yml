@@ -247,8 +247,8 @@ jobs:
               }
           }
           RSEOF
-          sed -i 's/__BLANK__//g' crates/skate-game/src/fb0_writer.rs
           sed -i 's/^          //' crates/skate-game/src/fb0_writer.rs
+          sed -i 's/__BLANK__//g' crates/skate-game/src/fb0_writer.rs
           echo "OK: crates/skate-game/src/fb0_writer.rs"
 
       - name: Prepare headless_plugin.rs
@@ -360,8 +360,8 @@ jobs:
               }
           }
           RSEOF
-          sed -i 's/__BLANK__//g' crates/skate-game/src/headless_plugin.rs
           sed -i 's/^          //' crates/skate-game/src/headless_plugin.rs
+          sed -i 's/__BLANK__//g' crates/skate-game/src/headless_plugin.rs
           echo "OK: crates/skate-game/src/headless_plugin.rs"
 
       - name: Prepare portmaster-Dateien
@@ -411,8 +411,8 @@ jobs:
           ### Performance (RK3326)
           - 448x336, shadows off, NPC draw dist 10u, traffic/ped 25%, V-Sync off
           MDEOF
-          sed -i 's/__BLANK__//g' portmaster/README.md
           sed -i 's/^          //' portmaster/README.md
+          sed -i 's/__BLANK__//g' portmaster/README.md
           cat > portmaster/gameinfo.xml <<'XEOF'
           <?xml version="1.0"?>
           <gameList>
@@ -740,30 +740,46 @@ jobs:
             exit 1
           fi
           cat > /tmp/patch_wgpu.py <<'PYEOF'
+          import re
           import sys
           path = "vendor/wgpu/wgpu-hal/src/gles/adapter.rs"
           text = open(path).read()
-          old = """let max_storage_buffers_per_shader_stage = if vertex_shader_storage_blocks == 0 {
-              fragment_shader_storage_blocks
-          } else {
-              vertex_shader_storage_blocks.min(fragment_shader_storage_blocks)
-          };"""
-          new = """let max_storage_buffers_per_shader_stage = if vertex_shader_storage_blocks == 0 {
-              if vertex_ssbo_false_zero {
-                  fragment_shader_storage_blocks
-              } else {
-                  0 // Mali-G31 R36S-Fix
-              }
-          } else {
-              vertex_shader_storage_blocks.min(fragment_shader_storage_blocks)
-          };"""
-          if new in text:
+
+          if "Mali-G31 R36S-Fix" in text:
               print("OK: Patch bereits vorhanden")
               sys.exit(0)
-          if old not in text:
-              print("FEHLER: Anker nicht gefunden", file=sys.stderr)
+
+          pattern = re.compile(
+              r'let\s+max_storage_buffers_per_shader_stage\s*=\s*'
+              r'if\s+vertex_shader_storage_blocks\s*==\s*0\s*\{'
+              r'\s*fragment_shader_storage_blocks\s*\}'
+              r'\s*else\s*\{'
+              r'\s*vertex_shader_storage_blocks\.min\(fragment_shader_storage_blocks\)\s*\}'
+              r'\s*;',
+              re.DOTALL
+          )
+
+          replacement = (
+              "let max_storage_buffers_per_shader_stage = if vertex_shader_storage_blocks == 0 {\n"
+              "            if vertex_ssbo_false_zero {\n"
+              "                fragment_shader_storage_blocks\n"
+              "            } else {\n"
+              "                0 // Mali-G31 R36S-Fix\n"
+              "            }\n"
+              "        } else {\n"
+              "            vertex_shader_storage_blocks.min(fragment_shader_storage_blocks)\n"
+              "        };"
+          )
+
+          new_text, count = pattern.subn(replacement, text, count=1)
+          if count == 0:
+              print("FEHLER: Muster nicht gefunden", file=sys.stderr)
+              for i, line in enumerate(text.splitlines(), 1):
+                  if "max_storage_buffers_per_shader_stage" in line:
+                      print(f"  Zeile {i}: {line!r}", file=sys.stderr)
               sys.exit(1)
-          open(path, "w").write(text.replace(old, new, 1))
+
+          open(path, "w").write(new_text)
           print("OK: wgpu-hal adapter.rs gepatcht")
           PYEOF
           python3 /tmp/patch_wgpu.py
