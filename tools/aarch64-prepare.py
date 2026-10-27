@@ -19,7 +19,8 @@ Wendet an:
  11. vendor/wgpu/wgpu-hal/Cargo.toml: naga mit termcolor-Feature
  12. vendor/wgpu/wgpu-hal/src/gles/adapter.rs (Mali-G31 SSBO-Fix)
  13. wgpu-hal Version verifizieren (27.0.4)
- 14. crates/skate-game/src/input/platform.rs: unused XinputCaps-Import entfernen
+ 14. crates/skate-game/src/input/platform.rs: unused XinputCaps-Import
+     NUR entfernen, wenn keine echte Code-Nutzung mehr vorhanden
  15. crates/**/*.rs: .fetch_update( → .try_update( (Rust 1.99 deprecated)
 
 Idempotent. Fehlschläge kritischer Patches → Exit 1.
@@ -1281,14 +1282,14 @@ def verify_wgpu_hal_version(expected="27.0.4"):
 # ═════════════════════════════════════════════════════════════════════
 # 14. crates/skate-game/src/input/platform.rs: unused XinputCaps-Import
 #
-# Der Compiler hat in der letzten Runde explizit bestätigt:
-#   warning: unused import: `XinputCaps`
-#   --> crates/skate-game/src/input/platform.rs:6:46
-# Also entfernen wir den aus der use-Zeile unbedingt. Die vorherige
-# "Sicherheitsnetz"-Logik (Regex-Suche über die ganze Datei) hat den
-# Patch bei count>1 übersprungen — das Vorkommen war in einem
-# Kommentar/String, nicht als echter Identifier. Dieser neue Patch
-# prüft nicht mehr, sondern entfernt.
+# WICHTIG (Fix für den letzten Build-Fehler):
+# - Der Import darf NUR entfernt werden, wenn XinputCaps nirgendwo sonst
+#   im File (außer der use-Zeile selbst) als echter Identifier vorkommt.
+# - Kommentare (//...) werden vor der Prüfung gestrippt, damit ein
+#   "// TODO: use XinputCaps" nicht fälschlich als Nutzung zählt.
+# - Wenn XinputCaps im Code verwendet wird (wie aktuell auf Zeile 207:
+#   "let caps = XinputCaps {"), bleibt der Import unangetastet — sonst
+#   Compile-Fehler "cannot find type XinputCaps".
 # ═════════════════════════════════════════════════════════════════════
 def patch_platform_unused_import():
     log("== crates/skate-game/src/input/platform.rs (unused XinputCaps) ==")
@@ -1297,16 +1298,16 @@ def patch_platform_unused_import():
         return
     text = PLATFORM_RS.read_text()
 
-    # Bereits gepatcht?
+    # Bereits gepatcht? (kein XinputCaps mehr, ControllerKind-only-Import)
     if ("use super::controller_kind::ControllerKind;" in text
             and "XinputCaps" not in text):
         log("  bereits gepatcht")
         return
 
-    # Beide Reihenfolgen abdecken.
+    # Beide Reihenfolgen abdecken, optionales trailing-comma
     patterns = [
-        r'use\s+super::controller_kind::\{\s*ControllerKind\s*,\s*XinputCaps\s*\}\s*;',
-        r'use\s+super::controller_kind::\{\s*XinputCaps\s*,\s*ControllerKind\s*\}\s*;',
+        r'use\s+super::controller_kind::\{\s*ControllerKind\s*,\s*XinputCaps\s*,?\s*\}\s*;',
+        r'use\s+super::controller_kind::\{\s*XinputCaps\s*,\s*ControllerKind\s*,?\s*\}\s*;',
     ]
     m = None
     for pat in patterns:
@@ -1317,6 +1318,20 @@ def patch_platform_unused_import():
     if not m:
         log("  Muster 'use super::controller_kind::{..., XinputCaps}' "
             "nicht gefunden – nichts zu tun")
+        return
+
+    # SICHERHEITSNETZ: Wenn XinputCaps außerhalb der use-Zeile als
+    # echter Identifier referenziert wird (nicht nur in Kommentaren),
+    # darf der Import NICHT entfernt werden — sonst Compile-Fehler.
+    rest = text[:m.start()] + text[m.end():]
+    # Line-Kommentare strippen (// bis Zeilenende), damit "// TODO: XinputCaps"
+    # nicht als Nutzung zählt. Block-Kommentare ignorieren wir bewusst —
+    # sie sind hier selten und der Fehlermodus (Import vorsichtig behalten)
+    # ist harmlos.
+    rest_no_comments = re.sub(r'//[^\n]*', '', rest)
+    if re.search(r'\bXinputCaps\b', rest_no_comments):
+        log("  XinputCaps wird außerhalb der use-Zeile im Code verwendet – "
+            "Import wird behalten (sonst Compile-Fehler)")
         return
 
     new_text = (text[:m.start()]
