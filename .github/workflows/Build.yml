@@ -209,16 +209,43 @@ jobs:
 
           echo ""
           echo "== headless_plugin.rs: Bevy-0.18-API =="
-          if grep -q 'R36S-Bevy0.18-Fix' crates/skate-game/src/headless_plugin.rs; then
-            echo "  OK: R36S-Bevy0.18-Fix"
-          elif grep -q 'Trigger<ScreenshotCaptured>' crates/skate-game/src/headless_plugin.rs; then
-            echo "  OK: Trigger<ScreenshotCaptured>"
+          if grep -q 'R36S-Bevy0.18-Option-Data' crates/skate-game/src/headless_plugin.rs; then
+            echo "  OK: R36S-Bevy0.18-Option-Data"
           elif grep -q 'MessageReader<ScreenshotCaptured>' crates/skate-game/src/headless_plugin.rs; then
             echo "  FEHLER: MessageReader<ScreenshotCaptured> ist vorhanden, Prepare hat nicht ersetzt"
             grep -n 'MessageReader\|ScreenshotCaptured' crates/skate-game/src/headless_plugin.rs || true
             exit 1
+          elif grep -q 'Trigger<ScreenshotCaptured>' crates/skate-game/src/headless_plugin.rs; then
+            echo "  FEHLER: Trigger<ScreenshotCaptured> ist vorhanden, Prepare hat nicht ersetzt"
+            grep -n 'Trigger\|ScreenshotCaptured' crates/skate-game/src/headless_plugin.rs || true
+            exit 1
+          elif grep -q 'R36S-Bevy0.18-Fix' crates/skate-game/src/headless_plugin.rs; then
+            echo "  FEHLER: alte R36S-Bevy0.18-Fix-Version (ohne Option-Data) – Prepare hat nicht ersetzt"
+            grep -n 'write_rgba8\|as_deref\|Option<Vec<u8>>' \
+              crates/skate-game/src/headless_plugin.rs || true
+            exit 1
           else
-            echo "  WARNUNG: unbekannter Screenshot-Mechanismus (kein Trigger/MessageReader erkannt)"
+            echo "  WARNUNG: unbekannter Screenshot-Mechanismus (kein erwarteter Marker)"
+          fi
+
+          echo ""
+          echo "== headless_plugin.rs: Image::data Option-Behandlung =="
+          if grep -qE 'msg\.image\.data\.as_deref|image\.data\.as_deref' \
+             crates/skate-game/src/headless_plugin.rs; then
+            echo "  OK: as_deref() auf Image::data"
+          else
+            echo "  FEHLER: kein as_deref() auf Image::data – E0308 erwartet"
+            grep -n 'write_rgba8\|image\.data' crates/skate-game/src/headless_plugin.rs || true
+            exit 1
+          fi
+
+          echo ""
+          echo "== headless_plugin.rs: FbState init_resource =="
+          if grep -q 'init_resource::<FbState>' crates/skate-game/src/headless_plugin.rs; then
+            echo "  OK: init_resource::<FbState>()"
+          else
+            echo "  FEHLER: init_resource::<FbState>() fehlt – Runtime-Panic erwartet"
+            exit 1
           fi
 
           echo ""
@@ -282,22 +309,24 @@ jobs:
           fi
 
       - name: PortMaster-Paket vorbereiten
-        if: always()
+        if: success()
         run: |
           set -euo pipefail
           STAGE="$GITHUB_WORKSPACE/dist"
           PORT_DIR="$STAGE/$PORT_NAME"
+          BIN="target/aarch64-unknown-linux-gnu/release/skate3rust"
+          if [ ! -x "$BIN" ]; then
+            echo "::error::Binary $BIN fehlt — Build gescheitert, kein PortMaster-Paket erzeugen"
+            exit 1
+          fi
           rm -rf "$STAGE"
           mkdir -p "$PORT_DIR/$PORT_NAME/assets"
-          BIN="target/aarch64-unknown-linux-gnu/release/skate3rust"
-          if [ -x "$BIN" ]; then
-            install -m 755 "$BIN" "$PORT_DIR/$PORT_NAME/skate3"
-            strip --strip-unneeded "$PORT_DIR/$PORT_NAME/skate3" 2>/dev/null || true
-          fi
+          install -m 755 "$BIN" "$PORT_DIR/$PORT_NAME/skate3"
+          strip --strip-unneeded "$PORT_DIR/$PORT_NAME/skate3" 2>/dev/null || true
           touch "$PORT_DIR/$PORT_NAME/assets/.gitkeep"
           cp portmaster/Skate3.sh portmaster/port.json \
-             portmaster/README.md portmaster/gameinfo.xml "$PORT_DIR/" 2>/dev/null || true
-          chmod 755 "$PORT_DIR/Skate3.sh" 2>/dev/null || true
+             portmaster/README.md portmaster/gameinfo.xml "$PORT_DIR/"
+          chmod 755 "$PORT_DIR/Skate3.sh"
           convert -size 640x480 xc:black -gravity center -fill white \
                   -pointsize 48 -annotate 0 "Skate 3" \
                   "$PORT_DIR/screenshot.jpg" 2>/dev/null || true
@@ -324,22 +353,24 @@ jobs:
           include-hidden-files: true
 
       - name: PortMaster ZIP
-        if: always()
+        if: success()
         run: |
           set -euo pipefail
           cd "$GITHUB_WORKSPACE/dist"
-          if [ -d "$PORT_NAME" ]; then
-            zip -r "skate3.zip" "$PORT_NAME"
-            unzip -l skate3.zip || true
+          if [ ! -d "$PORT_NAME" ]; then
+            echo "::error::dist/$PORT_NAME fehlt — PortMaster-Paket-Schritt gescheitert"
+            exit 1
           fi
+          zip -r "skate3.zip" "$PORT_NAME"
+          unzip -l skate3.zip || true
 
       - name: PortMaster Artifact
-        if: always()
+        if: success()
         uses: actions/upload-artifact@v4
         with:
           name: skate3-portmaster
           path: dist/skate3.zip
-          if-no-files-found: warn
+          if-no-files-found: error
           retention-days: 30
 
       - name: Build-Log Artifact
