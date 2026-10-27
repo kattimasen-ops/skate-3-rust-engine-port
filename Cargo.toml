@@ -18,7 +18,12 @@ edition = "2024"
 publish = false
 
 [workspace.dependencies]
-bevy = { version = "=0.18.1" }
+# multi_threaded ist standardmäßig in bevy aktiv, aber wir setzen es
+# explizit, damit ein späteres `default-features = false` (z.B. für
+# schnellere Builds) nicht versehentlich die Parallelisierung abschaltet.
+# Das war historisch ein häufiger Fehler in Bevy-Projekten: Task-Pool
+# mit N Threads konfiguriert, aber Aufgaben liefen strikt seriell.
+bevy = { version = "=0.18.1", features = ["multi_threaded"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 libc = "0.2"
@@ -59,6 +64,19 @@ panic = "abort"
 
 [profile.release.package."*"]
 opt-level = 2
+codegen-units = 16
+
+# ═════════════════════════════════════════════════════════════════════
+# Ausnahmen: Crates, die trotz "Dependencies"-Regel opt-level = 3
+# bekommen, weil sie in jedem Frame laufen und ihr Codegen direkt
+# die Laufzeit-Performance bestimmt.
+# ═════════════════════════════════════════════════════════════════════
+
+# Der Task-Pool selbst: verteilt Systeme und par_iter auf alle vier
+# Cortex-A35-Kerne. Seine inneren Schleifen (Job-Queue, Crossbeam,
+# Thread-Wecken) laufen auf jedem Frame mehrfach.
+[profile.release.package.bevy_tasks]
+opt-level = 3
 codegen-units = 16
 
 # ═════════════════════════════════════════════════════════════════════
