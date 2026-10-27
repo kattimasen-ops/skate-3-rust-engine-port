@@ -11,7 +11,8 @@ Wendet an:
              winit-disable nach .build(), ScheduleRunnerPlugin,
              GpuPreprocessingSupport, kein Box)
   6. fb0_writer.rs (nur wenn fehlt)
-  7. headless_plugin.rs (Bevy-0.18-Fix: On statt Trigger, Observer)
+  7. headless_plugin.rs (Bevy-0.18-Fix: On statt Trigger, Observer,
+                          Image::data = Option<Vec<u8>>, init_resource<FbState>)
   8. portmaster/ (nur wenn fehlt oder --force)
   9. vendor/wgpu: [package]-Vererbung hart auflösen
  10. vendor/wgpu: [dependencies]-Vererbung hart auflösen (via tomlkit)
@@ -264,7 +265,6 @@ def patch_main(text):
             warn("main.rs: 'fn main() -> bevy::app::AppExit {' fehlt")
     elif ('std::env::set_var("WGPU_BACKEND"' in text
           and 'unsafe {\n        std::env::set_var' not in text):
-        # Reparatur: bereits vorhandene set_var ohne unsafe
         text = text.replace(
             '    std::env::set_var("WGPU_BACKEND", "gl");\n'
             '    std::env::set_var("WGPU_SETTINGS_PRIO", "webgl2");',
@@ -286,7 +286,6 @@ def patch_main(text):
         else:
             warn("main.rs: app::build(...)-Anker fehlt")
 
-    # exit-Cast: std::process::exit erwartet i32
     if "std::process::exit(code)" in text:
         text = text.replace("std::process::exit(code)", "std::process::exit(code as i32)")
         changed = True
@@ -304,7 +303,6 @@ def prepare_main():
 def patch_app(text):
     changed = False
 
-    # Imports: ExitCondition ergänzen (liegt in bevy::window)
     if "use bevy::window::ExitCondition;" not in text:
         if "use bevy::prelude::*;" in text:
             text = text.replace("use bevy::prelude::*;",
@@ -321,7 +319,6 @@ def patch_app(text):
         text = text.replace("Backends::VULKAN", "Backends::GL", 1)
         changed = True
 
-    # Box::new ENTFERNEN, falls vorhanden (Bevy 0.18 will WgpuSettings direkt)
     if "Automatic(Box::new(WgpuSettings" in text:
         text = text.replace("Automatic(Box::new(WgpuSettings", "Automatic(WgpuSettings", 1)
         idx = text.find("Automatic(WgpuSettings")
@@ -333,7 +330,6 @@ def patch_app(text):
                     text = text[:close+1] + text[close+2:]
         changed = True
 
-    # primary_window: Some(Window{...}) → None
     if "primary_window: Some" in text and "primary_window: None" not in text:
         idx = text.find("primary_window: Some")
         j = idx + len("primary_window: Some")
@@ -345,7 +341,6 @@ def patch_app(text):
                 text = text[:idx] + "primary_window: None" + text[close + 1:]
                 changed = True
 
-    # ExitCondition einfügen
     if "ExitCondition::DontExit" not in text:
         anchor = "primary_window: None"
         idx = text.find(anchor)
@@ -366,7 +361,6 @@ def patch_app(text):
         else:
             warn("app.rs: 'primary_window: None' fehlt – exit_condition nicht eingefügt")
 
-    # Winit-disable NACH .build()
     if ("disable::<WinitPlugin>" not in text
             and "disable::<bevy::winit::WinitPlugin>" not in text):
         if ".build()" in text:
@@ -379,7 +373,6 @@ def patch_app(text):
         else:
             warn("app.rs: '.build()' fehlt – winit-disable nicht eingefügt")
 
-    # ScheduleRunnerPlugin
     if "ScheduleRunnerPlugin" not in text:
         m = re.search(r'app\.add_plugins\s*\(\s*\n?\s*DefaultPlugins', text)
         if m:
@@ -401,7 +394,6 @@ def patch_app(text):
         else:
             warn("app.rs: 'app.add_plugins(DefaultPlugins' nicht gefunden")
 
-    # GpuPreprocessingSupport: VOR dem finalen `app` einfügen, mit ;
     if "GpuPreprocessingSupport" not in text:
         idx = text.rfind("\n    app\n")
         if idx >= 0:
@@ -552,10 +544,15 @@ def prepare_fb0():
 
 
 # ═════════════════════════════════════════════════════════════════════
-# 7. headless_plugin.rs (Bevy-0.18-Fix)
+# 7. headless_plugin.rs
+#
+# R36S-Bevy0.18-Fix      : On<E> statt Trigger<E>, add_observer statt add_systems
+# R36S-Bevy0.18-Option-Data: Image::data ist Option<Vec<u8>>; as_deref() benutzen
 # ═════════════════════════════════════════════════════════════════════
 HEADLESS_RS_FALLBACK = r'''//! Headless-Rendering -> /dev/fb0 via Screenshot-API (Bevy 0.18).
+//!
 //! R36S-Bevy0.18-Fix: On statt Trigger, Observer statt MessageReader.
+//! R36S-Bevy0.18-Option-Data: Image::data ist Option<Vec<u8>> – as_deref() benutzen.
 use bevy::prelude::*;
 use bevy::camera::{ImageRenderTarget, RenderTarget};
 use bevy::camera::visibility::RenderLayers;
@@ -575,6 +572,7 @@ pub struct HeadlessFbPlugin;
 impl Plugin for HeadlessFbPlugin {
     fn build(&self, app: &mut App) {
         app.add_plugins(ScreenshotPlugin)
+            .init_resource::<FbState>()
             .add_systems(Startup, (clear_fb0, setup_offscreen).chain())
             .add_systems(Update, request_screenshot)
             .add_observer(copy_to_fb0);
@@ -595,7 +593,7 @@ fn clear_fb0(mut state: ResMut<FbState>) {
 fn setup_offscreen(
     mut commands: Commands,
     mut images: ResMut<Assets<Image>>,
-    mut state: ResMut<FbState>,
+    state: ResMut<FbState>,
 ) {
     let size = Extent3d { width: 448, height: 336, depth_or_array_layers: 1 };
     let mut image = Image {
@@ -642,28 +640,39 @@ fn request_screenshot(
 fn copy_to_fb0(trigger: On<ScreenshotCaptured>, mut state: ResMut<FbState>) {
     let msg = trigger.event();
     let Some(writer) = state.writer.as_mut() else { return; };
-    let _ = writer.write_rgba8(&msg.image.data, msg.image.width(), msg.image.height());
+    let Some(data) = msg.image.data.as_deref() else { return; };
+    let _ = writer.write_rgba8(data, msg.image.width(), msg.image.height());
 }
 '''
+
+OLD_HEADLESS_MARKERS = (
+    "MessageReader<ScreenshotCaptured>",
+    "Trigger<ScreenshotCaptured>",
+    "R36S-Bevy0.18-Fix",  # alte Version ohne Option-Data-Behandlung
+)
+
 
 def prepare_headless():
     log("== headless_plugin.rs ==")
     if HEADLESS_RS.exists():
         old = HEADLESS_RS.read_text()
-        if "R36S-Bevy0.18-Fix" in old:
-            log("  bereits auf Bevy-0.18-API gepatcht")
+
+        if "R36S-Bevy0.18-Option-Data" in old:
+            log("  bereits auf Bevy-0.18-API mit Option-Data gepatcht")
             return
-        if ("MessageReader<ScreenshotCaptured>" in old
-                or "Trigger<ScreenshotCaptured>" in old):
-            log("  alte Screenshot-Version erkannt – ersetze durch Observer-Version")
+
+        if any(m in old for m in OLD_HEADLESS_MARKERS):
+            log("  alte Screenshot-Version erkannt – ersetze durch Observer-Option-Version")
             if not CHECK_ONLY:
                 HEADLESS_RS.write_text(HEADLESS_RS_FALLBACK)
-                log(f"  gepatcht: {HEADLESS_RS.relative_to(ROOT)} (R36S-Bevy0.18-Fix)")
+                log(f"  gepatcht: {HEADLESS_RS.relative_to(ROOT)} (R36S-Bevy0.18-Option-Data)")
             else:
                 log("  würde patchen (CHECK_ONLY)")
             return
+
         log("  existiert bereits (deine Version wird verwendet)")
         return
+
     write_if_missing(HEADLESS_RS, HEADLESS_RS_FALLBACK)
 
 
