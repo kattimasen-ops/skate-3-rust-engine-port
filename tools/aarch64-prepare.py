@@ -5,7 +5,7 @@ aarch64-prepare.py — bereitet das Skate-3-Repo für RK3326/M9 Pro vor.
 Wendet an:
   1. .cargo/config.toml (Cross-Toolchain, Cortex-A35-Flags, Linker-Optimierung)
   2. Root-Cargo.toml (libc; alle wgpu-* + naga als Pfad-Patches)
-  3. skate-game/Cargo.toml (libc, default = [])
+  3. skate-game/Cargo.toml (libc, default = [], [lints.rust] dead_code = "allow")
   4. main.rs (Module, WGPU-Env in unsafe-Block, HeadlessFbPlugin, exit-Cast)
   5. app.rs (Backends::GL, primary_window: None, ExitCondition-Import,
              winit-disable nach .build(), ScheduleRunnerPlugin,
@@ -229,6 +229,20 @@ def patch_game_cargo(text):
         changed = True
     if 'default = ["dev-dynamic"]' in text:
         text = text.replace('default = ["dev-dynamic"]', 'default = []', 1)
+        changed = True
+    # [lints.rust] dead_code = "allow":
+    #   skate-game hat ~20 dead_code-Warnungen aus dem Engine-Code
+    #   (apt_vm/apt_scene/retail_menu_movies/input). Für einen Port
+    #   wollen wir den Build-Log lesbar halten — echte Bugs im
+    #   Port-Wrapper zeigen sich als compile errors, nicht als
+    #   dead_code-Warnungen. Leicht zu entfernen, wenn der Engine-Code
+    #   aufgeräumt wird.
+    if "dead_code" not in text:
+        if "[lints.rust]" not in text:
+            text += '\n[lints.rust]\ndead_code = "allow"\n'
+        else:
+            text = text.replace("[lints.rust]",
+                                '[lints.rust]\ndead_code = "allow"', 1)
         changed = True
     return text, changed
 
@@ -1266,6 +1280,15 @@ def verify_wgpu_hal_version(expected="27.0.4"):
 
 # ═════════════════════════════════════════════════════════════════════
 # 14. crates/skate-game/src/input/platform.rs: unused XinputCaps-Import
+#
+# Der Compiler hat in der letzten Runde explizit bestätigt:
+#   warning: unused import: `XinputCaps`
+#   --> crates/skate-game/src/input/platform.rs:6:46
+# Also entfernen wir den aus der use-Zeile unbedingt. Die vorherige
+# "Sicherheitsnetz"-Logik (Regex-Suche über die ganze Datei) hat den
+# Patch bei count>1 übersprungen — das Vorkommen war in einem
+# Kommentar/String, nicht als echter Identifier. Dieser neue Patch
+# prüft nicht mehr, sondern entfernt.
 # ═════════════════════════════════════════════════════════════════════
 def patch_platform_unused_import():
     log("== crates/skate-game/src/input/platform.rs (unused XinputCaps) ==")
@@ -1274,24 +1297,26 @@ def patch_platform_unused_import():
         return
     text = PLATFORM_RS.read_text()
 
-    # Bereits gepatcht (kein XinputCaps mehr, ControllerKind-only-Import vorhanden)?
+    # Bereits gepatcht?
     if ("use super::controller_kind::ControllerKind;" in text
             and "XinputCaps" not in text):
         log("  bereits gepatcht")
         return
 
-    m = re.search(
+    # Beide Reihenfolgen abdecken.
+    patterns = [
         r'use\s+super::controller_kind::\{\s*ControllerKind\s*,\s*XinputCaps\s*\}\s*;',
-        text,
-    )
-    if not m:
-        log("  Muster 'use super::controller_kind::{ControllerKind, XinputCaps};' nicht gefunden – nichts zu tun")
-        return
+        r'use\s+super::controller_kind::\{\s*XinputCaps\s*,\s*ControllerKind\s*\}\s*;',
+    ]
+    m = None
+    for pat in patterns:
+        m = re.search(pat, text)
+        if m:
+            break
 
-    # Sicherheitsnetz: XinputCaps darf außerhalb der use-Zeile nicht referenziert werden
-    rest = text[:m.start()] + text[m.end():]
-    if re.search(r'\bXinputCaps\b', rest):
-        warn("input/platform.rs: XinputCaps wird außerhalb der use-Zeile referenziert – manueller Eingriff nötig")
+    if not m:
+        log("  Muster 'use super::controller_kind::{..., XinputCaps}' "
+            "nicht gefunden – nichts zu tun")
         return
 
     new_text = (text[:m.start()]
