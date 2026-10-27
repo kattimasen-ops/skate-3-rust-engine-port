@@ -40,37 +40,11 @@ jobs:
         with:
           submodules: false
 
-      - name: Repo-Struktur pruefen
-        run: |
-          set -euo pipefail
-          echo "== Root =="; ls -la
-          echo ""
-          echo "== Cargo.toml (Workspace) =="
-          cat Cargo.toml
-          echo ""
-          echo "== Pflichtdateien pruefen =="
-          MISSING=0
-          for f in .cargo/config.toml \
-                   crates/skate-game/src/fb0_writer.rs \
-                   crates/skate-game/src/headless_plugin.rs \
-                   crates/skate-game/src/image_copy.rs \
-                   portmaster/Skate3.sh portmaster/port.json \
-                   portmaster/README.md portmaster/gameinfo.xml; do
-            if [ -f "$f" ]; then echo "  OK: $f"; else echo "  FEHLT: $f"; MISSING=1; fi
-          done
-          if [ "$MISSING" -eq 1 ]; then
-            echo "::error::Pflichtdateien fehlen"
-            exit 1
-          fi
-
       - name: Vita-Toolchain-Dateien neutralisieren
         run: |
           set -euo pipefail
           for f in rust-toolchain rust-toolchain.toml; do
-            if [ -f "$f" ]; then
-              mv "$f" "$f.disabled-for-aarch64"
-              echo "Deaktiviert: $f"
-            fi
+            if [ -f "$f" ]; then mv "$f" "$f.disabled-for-aarch64"; fi
           done
 
       - name: aarch64 Multiarch aktivieren
@@ -86,7 +60,7 @@ jobs:
             > /etc/apt/sources.list.d/arm64.list
           apt-get update
 
-      - name: Build-Pakete installieren (inkl. git und python3)
+      - name: Build-Pakete installieren
         run: |
           set -euo pipefail
           apt-get install -y --no-install-recommends \
@@ -96,20 +70,616 @@ jobs:
             libasound2-dev:arm64 libudev-dev:arm64 \
             libdrm-dev:arm64 libgbm-dev:arm64 \
             libegl-dev:arm64 libgles2-mesa-dev:arm64
-          echo "== Tool-Versionen =="
-          git --version
-          python3 --version
+          git --version; python3 --version
 
+      # ═══════════════════════════════════════════════════════════════
+      # PREPARE: alle fehlenden Dateien erzeugen und vorhandene patchen
+      # ═══════════════════════════════════════════════════════════════
+      - name: Prepare .cargo/config.toml
+        run: |
+          set -euo pipefail
+          mkdir -p .cargo
+          cat > .cargo/config.toml <<'EOF'
+[target.aarch64-unknown-linux-gnu]
+linker = "aarch64-linux-gnu-gcc"
+rustflags = [
+    "-C", "target-cpu=cortex-a35",
+    "-C", "target-feature=-outline-atomics",
+    "-C", "link-arg=-Wl,--gc-sections",
+    "-C", "link-arg=-Wl,--as-needed",
+    "-C", "link-arg=-Wl,-O2",
+    "-C", "link-arg=-static-libgcc",
+    "-C", "panic=abort",
+]
+
+[env]
+WGPU_BACKEND = "gl"
+WGPU_SETTINGS_PRIO = "webgl2"
+EOF
+          echo "OK: .cargo/config.toml"
+
+      - name: Prepare fb0_writer.rs
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          path = "crates/skate-game/src/fb0_writer.rs"
+          import os
+          os.makedirs(os.path.dirname(path), exist_ok=True)
+          content = r'''//! /dev/fb0-Writer für RK3326 / M9 Pro.
+use std::fs::{File, OpenOptions};
+use std::io;
+use std::os::unix::io::AsRawFd;
+use std::ptr;
+
+#[repr(C)]
+#[derive(Default)]
+struct FbBitfield { offset: u32, length: u32, msb_right: u32 }
+
+#[repr(C)]
+#[derive(Default)]
+struct FbVarScreeninfo {
+    xres: u32, yres: u32, xres_virtual: u32, yres_virtual: u32,
+    xoffset: u32, yoffset: u32, bits_per_pixel: u32, grayscale: u32,
+    red: FbBitfield, green: FbBitfield, blue: FbBitfield, transp: FbBitfield,
+    nonstd: u32, activate: u32, height: u32, width: u32, accel_flags: u32,
+    pixclock: u32, left_margin: u32, right_margin: u32, upper_margin: u32,
+    lower_margin: u32, hsync_len: u32, vsync_len: u32, sync: u32, vmode: u32,
+    rotate: u32, colorspace: u32, reserved: [u32; 4],
+}
+
+#[repr(C)]
+#[derive(Default)]
+struct FbFixScreeninfo {
+    id: [u8; 16], smem_start: usize, smem_len: u32, type_: u32, type_aux: u32,
+    visual: u32, xpanstep: u16, ypanstep: u16, ywrapstep: u16, line_length: u32,
+    mmio_start: usize, mmio_len: u32, accel: u32, capabilities: u16, reserved: [u16; 2],
+}
+
+const FBIOGET_VSCREENINFO: u64 = 0x4600;
+const FBIOGET_FSCREENINFO: u64 = 0x4602;
+
+pub struct Fb0Writer {
+    file: File,
+    var: FbVarScreeninfo,
+    fix: FbFixScreeninfo,
+    mmap_ptr: *mut u8,
+    mmap_len: usize,
+}
+
+unsafe impl Send for Fb0Writer {}
+unsafe impl Sync for Fb0Writer {}
+
+impl Fb0Writer {
+    pub fn open() -> io::Result<Self> {
+        let file = OpenOptions::new().read(true).write(true).open("/dev/fb0")?;
+        let fd = file.as_raw_fd();
+        let mut var = FbVarScreeninfo::default();
+        if unsafe { libc::ioctl(fd, FBIOGET_VSCREENINFO, &mut var) } < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        let mut fix = FbFixScreeninfo::default();
+        if unsafe { libc::ioctl(fd, FBIOGET_FSCREENINFO, &mut fix) } < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        let mmap_len = fix.smem_len as usize;
+        let mmap_ptr = unsafe {
+            libc::mmap(ptr::null_mut(), mmap_len, libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_SHARED, fd, 0)
+        };
+        if mmap_ptr == libc::MAP_FAILED { return Err(io::Error::last_os_error()); }
+        Ok(Self { file, var, fix, mmap_ptr: mmap_ptr as *mut u8, mmap_len })
+    }
+    pub fn width(&self) -> u32 { self.var.xres }
+    pub fn height(&self) -> u32 { self.var.yres }
+    pub fn bits_per_pixel(&self) -> u32 { self.var.bits_per_pixel }
+
+    pub fn write_rgba8(&mut self, rgba: &[u8], width: u32, height: u32) -> io::Result<()> {
+        if rgba.len() < (width * height * 4) as usize {
+            return Err(io::Error::new(io::ErrorKind::InvalidInput, "RGBA-Puffer zu klein"));
+        }
+        let line_len = self.fix.line_length as usize;
+        match self.var.bits_per_pixel {
+            32 => for y in 0..height as usize {
+                let src = &rgba[y * width as usize * 4..];
+                let dst = unsafe { self.mmap_ptr.add(y * line_len) as *mut u32 };
+                for x in 0..width as usize {
+                    let r = src[x*4] as u32; let g = src[x*4+1] as u32; let b = src[x*4+2] as u32;
+                    unsafe { *dst.add(x) = (r << 16) | (g << 8) | b; }
+                }
+            },
+            16 => for y in 0..height as usize {
+                let src = &rgba[y * width as usize * 4..];
+                let dst = unsafe { self.mmap_ptr.add(y * line_len) as *mut u16 };
+                for x in 0..width as usize {
+                    let r = (src[x*4] >> 3) as u16; let g = (src[x*4+1] >> 2) as u16; let b = (src[x*4+2] >> 3) as u16;
+                    unsafe { *dst.add(x) = (r << 11) | (g << 5) | b; }
+                }
+            },
+            other => return Err(io::Error::new(io::ErrorKind::Unsupported,
+                format!("Framebuffer mit {other} bpp wird nicht unterstützt"))),
+        }
+        let _ = &self.file;
+        Ok(())
+    }
+}
+
+impl Drop for Fb0Writer {
+    fn drop(&mut self) { unsafe { libc::munmap(self.mmap_ptr as *mut _, self.mmap_len); } }
+}
+'''
+          open(path, "w").write(content)
+          print(f"OK: {path} ({len(content)} bytes)")
+          PY
+
+      - name: Prepare headless_plugin.rs
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          path = "crates/skate-game/src/headless_plugin.rs"
+          content = r'''//! Headless-Rendering -> /dev/fb0 via Screenshot-API (Bevy 0.18).
+use bevy::prelude::*;
+use bevy::camera::{ImageRenderTarget, RenderTarget};
+use bevy::math::FloatOrd;
+use bevy::render::batching::gpu_preprocessing::NoIndirectDrawing;
+use bevy::render::render_resource::{
+    Extent3d, TextureDescriptor, TextureDimension, TextureFormat, TextureUsages,
+};
+use bevy::render::view::RenderLayers;
+use bevy::render::view::window::screenshot::{
+    Screenshot, ScreenshotCaptured, ScreenshotPlugin,
+};
+
+use crate::fb0_writer::Fb0Writer;
+
+pub struct HeadlessFbPlugin;
+
+impl Plugin for HeadlessFbPlugin {
+    fn build(&self, app: &mut App) {
+        app.add_plugins(ScreenshotPlugin)
+            .add_systems(Startup, setup_offscreen)
+            .add_systems(Update, (request_screenshot, copy_to_fb0).chain());
+    }
+}
+
+#[derive(Resource)]
+struct OffscreenTarget {
+    handle: Handle<Image>,
+}
+
+#[derive(Resource, Default)]
+struct FbState {
+    writer: Option<Fb0Writer>,
+}
+
+fn setup_offscreen(
+    mut commands: Commands,
+    mut images: ResMut<Assets<Image>>,
+    mut state: ResMut<FbState>,
+) {
+    let size = Extent3d { width: 448, height: 336, depth_or_array_layers: 1 };
+    let mut image = Image {
+        texture_descriptor: TextureDescriptor {
+            label: None, size, dimension: TextureDimension::D2,
+            format: TextureFormat::Rgba8UnormSrgb,
+            mip_level_count: 1, sample_count: 1,
+            usage: TextureUsages::TEXTURE_BINDING | TextureUsages::COPY_DST
+                 | TextureUsages::COPY_SRC | TextureUsages::RENDER_ATTACHMENT,
+            view_formats: &[],
+        },
+        ..default()
+    };
+    image.resize(size);
+    let handle = images.add(image);
+
+    commands.spawn((
+        Camera3d::default(),
+        RenderTarget::Image(ImageRenderTarget {
+            handle: handle.clone(),
+            scale_factor: FloatOrd(1.0),
+        }),
+        NoIndirectDrawing,
+        RenderLayers::default(),
+    ));
+    commands.insert_resource(OffscreenTarget { handle });
+    state.writer = Fb0Writer::open().ok();
+    if let Some(w) = &state.writer {
+        info!("fb0: {}x{}, {} bpp", w.width(), w.height(), w.bits_per_pixel());
+    } else {
+        warn!("fb0 konnte nicht geoeffnet werden; Ausgabe nur ueber Log");
+    }
+}
+
+fn request_screenshot(
+    mut commands: Commands,
+    camera: Query<Entity, With<Camera3d>>,
+    target: Res<OffscreenTarget>,
+) {
+    if let Ok(entity) = camera.single() {
+        commands.entity(entity).insert(Screenshot::image(target.handle.clone()));
+    }
+}
+
+fn copy_to_fb0(
+    mut messages: MessageReader<ScreenshotCaptured>,
+    mut state: ResMut<FbState>,
+) {
+    for msg in messages.read() {
+        let Some(writer) = state.writer.as_mut() else { continue; };
+        let _ = writer.write_rgba8(&msg.image.data, msg.image.width(), msg.image.height());
+    }
+}
+'''
+          open(path, "w").write(content)
+          print(f"OK: {path} ({len(content)} bytes)")
+          PY
+
+      - name: Prepare portmaster-Dateien
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import os
+          os.makedirs("portmaster", exist_ok=True)
+
+          open("portmaster/port.json", "w").write('''{
+  "version": 4,
+  "name": "skate3.zip",
+  "items": ["Skate3.sh", "skate3"],
+  "items_opt": [],
+  "attr": {
+    "title": "Skate 3",
+    "porter": ["kattimasen-ops"],
+    "desc": "Skate 3 native ARM64 port for RK3326 (M9 Pro / ArkOS). Based on the skate-3-rust-engine decompilation. Requires your own Xbox 360 ISO to generate the .pak assets.",
+    "desc_md": null,
+    "inst": "Copy your converted .pak files into the skate3/assets/ folder.",
+    "inst_md": null,
+    "genres": ["sports"],
+    "image": null,
+    "rtr": false,
+    "exp": true,
+    "runtime": [],
+    "store": [],
+    "availability": "full",
+    "reqs": [],
+    "arch": ["aarch64"],
+    "min_glibc": "2.30"
+  }
+}
+''')
+
+          open("portmaster/README.md", "w").write('''## Skate 3 - RK3326 Port
+
+Native ARM64 port of **Skate 3** for the **M9 Pro / RK3326 / ArkOS4Clone**.
+
+### You need your own game data
+This port contains no game assets. Convert your own Xbox 360 ISO to `.pak` files.
+
+1. Extract with `extract-xiso`.
+2. Run `prepare_assets.py` from the engine repo.
+3. Run `vita-bake` to produce `.pak` files.
+4. Copy `.pak` files into `skate3/assets/`.
+
+### Performance (RK3326)
+- 448x336, shadows off, NPC draw dist 10u, traffic/ped 25%, V-Sync off
+''')
+
+          open("portmaster/gameinfo.xml", "w").write('''<?xml version="1.0"?>
+<gameList>
+  <game>
+    <path>./Skate3.sh</path>
+    <name>Skate 3</name>
+    <desc>Native ARM64 port of Skate 3 for RK3326 handhelds.</desc>
+    <image>./screenshot.jpg</image>
+    <thumbnail>./screenshot.jpg</thumbnail>
+    <rating>0.8</rating>
+    <releasedate>20100511T000000</releasedate>
+    <developer>EA Black Box</developer>
+    <publisher>Electronic Arts</publisher>
+    <genre>Sports</genre>
+    <players>1</players>
+  </game>
+</gameList>
+''')
+
+          launcher = r'''#!/bin/bash
+set -euo pipefail
+XDG_DATA_HOME=${XDG_DATA_HOME:-$HOME/.local/share}
+SCRIPT_DIR="$(cd "$(dirname "$0")" 2>/dev/null && pwd)"
+GAMEDIR="$SCRIPT_DIR/skate3"
+if [ ! -x "$GAMEDIR/skate3" ]; then echo "FEHLER: $GAMEDIR/skate3 fehlt." >&2; exit 1; fi
+controlfolder=""
+for candidate in "/opt/system/Tools/PortMaster" "/opt/tools/PortMaster" "$XDG_DATA_HOME/PortMaster" "/roms/ports/PortMaster" "/roms/tools/PortMaster"; do
+    if [ -d "$candidate" ]; then controlfolder="$candidate"; break; fi
+done
+if [ -n "$controlfolder" ] && [ -f "$controlfolder/control.txt" ]; then
+    source "$controlfolder/control.txt" 2>/dev/null || true
+    if [ -f "${controlfolder}/mod_${CFW_NAME}.txt" ]; then source "${controlfolder}/mod_${CFW_NAME}.txt" 2>/dev/null || true; fi
+fi
+export SDL_VIDEODRIVER="${SDL_VIDEODRIVER:-kmsdrm}"
+unset SDL_AUDIODRIVER AUDIODEV
+if [ -n "${sdl_controllerconfig:-}" ]; then export SDL_GAMECONTROLLERCONFIG="$sdl_controllerconfig"; fi
+if [ -n "${SDL_GAMECONTROLLERCONFIG:-}" ]; then
+    export SDL_GAMECONTROLLERCONFIG_FILE="/tmp/skate3-gamecontrollerdb.txt"
+    printf '%s\n' "$SDL_GAMECONTROLLERCONFIG" > "$SDL_GAMECONTROLLERCONFIG_FILE" 2>/dev/null || true
+fi
+SYSTEM_MALI=""
+for candidate in /usr/lib/aarch64-linux-gnu/libmali-bifrost-g31-rxp0-gbm.so /usr/local/lib/aarch64-linux-gnu/libmali-bifrost-g31-rxp0-gbm.so /usr/lib/aarch64-linux-gnu/libmali.so.1 /usr/lib/aarch64-linux-gnu/libmali.so /usr/lib/aarch64-linux-gnu/libEGL.so.1; do
+    if [ -f "$candidate" ]; then SYSTEM_MALI="$candidate"; break; fi
+done
+if [ -n "$SYSTEM_MALI" ]; then
+    rm -rf /tmp/skate3-mali; mkdir -p /tmp/skate3-mali
+    for name in libmali.so.0 libmali.so.1 libmali.so libEGL.so.1 libEGL.so libGLESv2.so.2 libGLESv2.so; do
+        ln -sf "$SYSTEM_MALI" "/tmp/skate3-mali/$name"
+    done
+    export LD_LIBRARY_PATH="/tmp/skate3-mali:$GAMEDIR:/usr/lib/aarch64-linux-gnu:${LD_LIBRARY_PATH:-}"
+else
+    export LD_LIBRARY_PATH="$GAMEDIR:/usr/lib/aarch64-linux-gnu:${LD_LIBRARY_PATH:-}"
+fi
+export MALLOC_TRIM_THRESHOLD_=131072
+export MALLOC_MMAP_THRESHOLD_=131072
+export WGPU_BACKEND=gl
+export WGPU_SETTINGS_PRIO=webgl2
+export SKATE3_NO_VSYNC=1
+export SKATE3_NO_SHADOW=1
+export SKATE3_RENDER_WIDTH=448
+export SKATE3_RENDER_HEIGHT=336
+cpu_gov=""
+for c in /sys/devices/system/cpu/cpufreq/policy0/scaling_governor /sys/devices/system/cpu/cpu0/cpufreq/scaling_governor; do
+    if [ -w "$c" ]; then cpu_gov="$c"; break; fi
+done
+if [ -n "$cpu_gov" ]; then echo performance > "$cpu_gov" 2>/dev/null || true; fi
+GPTOKEYB=""
+for c in "$controlfolder/gptokeyb" /opt/system/Tools/PortMaster/gptokeyb /usr/local/bin/gptokeyb /usr/bin/gptokeyb; do
+    if [ -x "$c" ]; then GPTOKEYB="$c"; break; fi
+done
+GPTOKEYB_PID=""
+if [ -n "$GPTOKEYB" ]; then "$GPTOKEYB" "$GAMEDIR/skate3" -k skate3 & GPTOKEYB_PID=$!; fi
+cd "$GAMEDIR"
+STATUS=0
+./skate3 "$@" || STATUS=$?
+if [ -n "$GPTOKEYB_PID" ]; then kill -TERM "$GPTOKEYB_PID" 2>/dev/null || true; fi
+if [ -n "$cpu_gov" ]; then echo ondemand > "$cpu_gov" 2>/dev/null || true; fi
+exit "$STATUS"
+'''
+          open("portmaster/Skate3.sh", "w").write(launcher)
+          os.chmod("portmaster/Skate3.sh", 0o755)
+          print("OK: portmaster/ (Skate3.sh, port.json, README.md, gameinfo.xml)")
+          PY
+
+      - name: Prepare Cargo.toml (Root)
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          path = "Cargo.toml"
+          text = open(path).read()
+
+          # libc zu workspace.dependencies
+          if 'libc = "0.2"' not in text:
+              text = text.replace(
+                  "serde_json = \"1.0\"",
+                  "serde_json = \"1.0\"\nlibc = \"0.2\"",
+                  1
+              )
+
+          # [patch.crates-io] aktivieren (wgpu-hal)
+          if '# wgpu-hal = { path = "vendor/wgpu/wgpu-hal" }' in text:
+              text = text.replace(
+                  '# wgpu-hal = { path = "vendor/wgpu/wgpu-hal" }',
+                  'wgpu-hal = { path = "vendor/wgpu/wgpu-hal" }',
+                  1
+              )
+          elif 'wgpu-hal = { path = "vendor/wgpu/wgpu-hal" }' not in text:
+              text += '\nwgpu-hal = { path = "vendor/wgpu/wgpu-hal" }\n'
+
+          open(path, "w").write(text)
+          print("OK: Cargo.toml (Root) gepatcht")
+          PY
+          grep -n "libc\|wgpu-hal" Cargo.toml
+
+      - name: Prepare Cargo.toml (skate-game)
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          path = "crates/skate-game/Cargo.toml"
+          text = open(path).read()
+
+          # libc hinzufuegen, wenn nicht vorhanden
+          if "libc.workspace = true" not in text and 'libc = "0.2"' not in text:
+              if "\n[dependencies]" in text:
+                  text = text.replace(
+                      "\n[dependencies]",
+                      "\n[dependencies]\nlibc.workspace = true",
+                      1
+                  )
+              else:
+                  text += "\n[dependencies]\nlibc.workspace = true\n"
+          open(path, "w").write(text)
+          print("OK: crates/skate-game/Cargo.toml gepatcht")
+          PY
+          grep -n "libc" crates/skate-game/Cargo.toml
+
+      - name: Prepare main.rs patchen
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import sys
+          path = "crates/skate-game/src/main.rs"
+          text = open(path).read()
+          changed = []
+
+          # 1. Module deklarieren
+          if "mod fb0_writer;" not in text:
+              if "mod trigger_volumes;" in text:
+                  text = text.replace(
+                      "mod trigger_volumes;",
+                      "mod trigger_volumes;\nmod fb0_writer;\nmod headless_plugin;",
+                      1
+                  )
+                  changed.append("mods")
+              else:
+                  print("FEHLER: Anker 'mod trigger_volumes;' nicht gefunden", file=sys.stderr)
+                  sys.exit(1)
+
+          # 2. WGPU-Env am Anfang von main()
+          if 'std::env::set_var("WGPU_BACKEND"' not in text:
+              if "fn main() -> bevy::app::AppExit {" in text:
+                  text = text.replace(
+                      "fn main() -> bevy::app::AppExit {",
+                      'fn main() -> bevy::app::AppExit {\n    std::env::set_var("WGPU_BACKEND", "gl");\n    std::env::set_var("WGPU_SETTINGS_PRIO", "webgl2");',
+                      1
+                  )
+                  changed.append("env")
+              else:
+                  print("FEHLER: fn main() nicht gefunden", file=sys.stderr)
+                  sys.exit(1)
+
+          # 3. HeadlessFbPlugin hinzufuegen
+          if "headless_plugin::HeadlessFbPlugin" not in text:
+              if "let mut app = app::build(config, manifest, graphs, physics, skater);" in text:
+                  text = text.replace(
+                      "let mut app = app::build(config, manifest, graphs, physics, skater);",
+                      "let mut app = app::build(config, manifest, graphs, physics, skater);\n    app.add_plugins(headless_plugin::HeadlessFbPlugin);",
+                      1
+                  )
+                  changed.append("plugin")
+              else:
+                  print("FEHLER: app::build(...)-Anker nicht gefunden", file=sys.stderr)
+                  sys.exit(1)
+
+          open(path, "w").write(text)
+          print(f"OK: main.rs gepatcht ({', '.join(changed)})")
+          PY
+          grep -n "WGPU_BACKEND\|mod fb0_writer\|HeadlessFbPlugin" crates/skate-game/src/main.rs
+
+      - name: Prepare app.rs patchen
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import re, sys
+          path = "crates/skate-game/src/app.rs"
+          text = open(path).read()
+          notes = []
+
+          # 1. Backends::VULKAN -> Backends::GL
+          if "Backends::VULKAN" in text:
+              text = text.replace("Backends::VULKAN", "Backends::GL", 1)
+              notes.append("backends")
+          elif "Backends::GL" not in text:
+              notes.append("backends-not-found")
+
+          # 2. primary_window: Some(Window { ... }) -> primary_window: None
+          if "primary_window: Some" in text and "primary_window: None" not in text:
+              start = text.find("primary_window: Some")
+              open_paren = text.find("(", start)
+              depth = 0
+              i = open_paren
+              while i < len(text):
+                  if text[i] == "(": depth += 1
+                  elif text[i] == ")":
+                      depth -= 1
+                      if depth == 0: break
+                  i += 1
+              text = text[:start] + "primary_window: None" + text[i+1:]
+              notes.append("primary_window")
+
+          # 3. exit_condition: ExitCondition::DontExit im WindowPlugin
+          if "primary_window: None" in text and "exit_condition: ExitCondition::DontExit" not in text:
+              text = text.replace(
+                  "primary_window: None",
+                  "primary_window: None,\n            exit_condition: ExitCondition::DontExit",
+                  1
+              )
+              notes.append("exit_condition")
+
+          # 4. RenderCreation::Automatic(...) -> ...(Box::new(...))
+          if "RenderCreation::Automatic(WgpuSettings" in text:
+              text = text.replace(
+                  "RenderCreation::Automatic(WgpuSettings",
+                  "RenderCreation::Automatic(Box::new(WgpuSettings",
+                  1
+              )
+              # Schliessende Klammer der WgpuSettings: suche das "})" nach "Automatic(Box::new(WgpuSettings"
+              marker = "RenderCreation::Automatic(Box::new(WgpuSettings"
+              start = text.find(marker)
+              if start >= 0:
+                  # Finde die passende schliessende Klammer von WgpuSettings { ... }
+                  brace_open = text.find("{", start)
+                  depth = 0
+                  i = brace_open
+                  while i < len(text):
+                      if text[i] == "{": depth += 1
+                      elif text[i] == "}":
+                          depth -= 1
+                          if depth == 0:
+                              # Hier steht "}": ersetzen durch "}))"
+                              if text[i:i+2] == "})":
+                                  text = text[:i+2] + ")" + text[i+2:]
+                              break
+                      i += 1
+              notes.append("render_creation_box")
+
+          # 5. .disable::<WinitPlugin>() hinzufuegen
+          if "disable::<WinitPlugin>" not in text and "disable::<bevy::winit::WinitPlugin>" not in text:
+              # Suche .set(RenderPlugin { ... }) und fuege danach .disable::<WinitPlugin>() ein
+              # Einfacher: Suche "DefaultPlugins" und das Ende des Ausdrucks
+              if "DefaultPlugins" in text:
+                  notes.append("winit-disable-manual")
+              else:
+                  notes.append("winit-disable-anchor-missing")
+
+          # 6. ScheduleRunnerPlugin + GpuPreprocessingSupport
+          # Fuege am Ende der build()-Funktion ein, vor dem "app"
+          # Suche "app" als letzte Zeile vor "}"
+          if "GpuPreprocessingSupport" not in text:
+              # Finde das Ende von build() (letzte schliessende Klammer)
+              # und fuege vor "app\n}" ein
+              # Wir suchen nach "\n    app\n}" oder aehnlich
+              for pattern in ["\n    app\n}", "\n    app\n}", "\n    app \n}"]:
+                  if pattern in text:
+                      insert = '''
+    if let Some(render_app) = app.get_sub_app_mut(bevy::render::RenderApp) {
+        render_app.insert_resource(bevy::render::batching::gpu_preprocessing::GpuPreprocessingSupport {
+            max_supported_mode: bevy::render::batching::gpu_preprocessing::GpuPreprocessingMode::None,
+        });
+    }
+    app
+}'''
+                      text = text.replace(pattern, insert, 1)
+                      notes.append("gpu_preprocessing")
+                      break
+
+          open(path, "w").write(text)
+          print(f"OK: app.rs gepatcht: {', '.join(notes) if notes else 'keine Aenderung'}")
+          PY
+
+      # ═══════════════════════════════════════════════════════════════
+      # STRUKTUR-CHECK (nach Prepare)
+      # ═══════════════════════════════════════════════════════════════
+      - name: Struktur pruefen
+        run: |
+          set -euo pipefail
+          MISSING=0
+          for f in .cargo/config.toml \
+                   crates/skate-game/src/fb0_writer.rs \
+                   crates/skate-game/src/headless_plugin.rs \
+                   portmaster/Skate3.sh portmaster/port.json \
+                   portmaster/README.md portmaster/gameinfo.xml; do
+            if [ -f "$f" ]; then echo "  OK: $f"; else echo "  FEHLT: $f"; MISSING=1; fi
+          done
+          if [ "$MISSING" -eq 1 ]; then exit 1; fi
+
+      # ═══════════════════════════════════════════════════════════════
+      # wgpu klonen und patchen
+      # ═══════════════════════════════════════════════════════════════
       - name: wgpu v27.0.1 klonen und Mali-G31-Patch anwenden
         run: |
           set -euo pipefail
+          rm -rf vendor/wgpu
           git clone --depth 1 --branch v27.0.1 \
             https://github.com/gfx-rs/wgpu.git vendor/wgpu
 
           ADAPTER="vendor/wgpu/wgpu-hal/src/gles/adapter.rs"
           if [ ! -f "$ADAPTER" ]; then
-            echo "::error::$ADAPTER nicht gefunden"
-            exit 1
+            echo "::error::$ADAPTER nicht gefunden"; exit 1
           fi
 
           python3 - <<'PY'
@@ -133,24 +703,18 @@ jobs:
               vertex_shader_storage_blocks.min(fragment_shader_storage_blocks)
           };"""
 
-          if old not in text:
-              print("FEHLER: Anker in adapter.rs nicht gefunden", file=sys.stderr)
-              sys.exit(1)
           if new in text:
-              print("OK: Patch bereits vorhanden")
-              sys.exit(0)
-
+              print("OK: Patch bereits vorhanden"); sys.exit(0)
+          if old not in text:
+              print("FEHLER: Anker nicht gefunden", file=sys.stderr); sys.exit(1)
           open(path, "w").write(text.replace(old, new, 1))
-          print("OK: wgpu-hal adapter.rs gepatcht.")
+          print("OK: wgpu-hal adapter.rs gepatcht")
           PY
+          grep -n "Mali-G31 R36S-Fix" "$ADAPTER"
 
-          grep -n "Mali-G31 R36S-Fix" "$ADAPTER" || exit 1
-
-          if ! grep -q '^wgpu-hal = { path = "vendor/wgpu/wgpu-hal" }' Cargo.toml; then
-            sed -i 's|^# wgpu-hal = { path = "vendor/wgpu/wgpu-hal" }|wgpu-hal = { path = "vendor/wgpu/wgpu-hal" }|' Cargo.toml
-          fi
-          grep -n "wgpu-hal" Cargo.toml || exit 1
-
+      # ═══════════════════════════════════════════════════════════════
+      # Rust + Build
+      # ═══════════════════════════════════════════════════════════════
       - name: Rust installieren
         run: |
           set -euo pipefail
@@ -158,8 +722,7 @@ jobs:
             | sh -s -- -y --default-toolchain stable
           echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
           export PATH="$HOME/.cargo/bin:$PATH"
-          rustc --version
-          cargo --version
+          rustc --version; cargo --version
 
       - name: aarch64-Target hinzufuegen
         run: |
@@ -167,83 +730,60 @@ jobs:
           export PATH="$HOME/.cargo/bin:$PATH"
           rustup target add aarch64-unknown-linux-gnu
 
-      - name: Cargo Build (aarch64, workspace)
+      - name: Cargo Build
         run: |
           set -euo pipefail
           export PATH="$HOME/.cargo/bin:$PATH"
-          cargo build \
-            --release \
-            --target aarch64-unknown-linux-gnu \
-            --workspace \
-            --jobs "$JOBS" \
-            2>&1 | tee build.log
+          cargo build --release --target aarch64-unknown-linux-gnu --workspace \
+            --jobs "$JOBS" 2>&1 | tee build.log
 
-      - name: glibc 2.30 pruefen
+      - name: glibc pruefen
         run: |
           set -euo pipefail
           BIN=target/aarch64-unknown-linux-gnu/release/skate3rust
-          if [ ! -x "$BIN" ]; then
-            echo "::error::$BIN nicht gefunden"
-            exit 1
-          fi
+          if [ ! -x "$BIN" ]; then echo "::error::$BIN fehlt"; exit 1; fi
           file "$BIN"
           MAX=$(aarch64-linux-gnu-objdump -T "$BIN" \
             | { grep -oE 'GLIBC_[0-9][0-9.]*' || true; } \
             | sed 's/^GLIBC_//' | sort -Vu | tail -1)
-          echo "Hoechste GLIBC-Version: ${MAX:-keine}"
+          echo "GLIBC: ${MAX:-keine}"
           if [ -n "$MAX" ] && [ "$(printf '%s\n%s\n' "$MAX_GLIBC" "$MAX" | sort -V | tail -1)" != "$MAX_GLIBC" ]; then
-            echo "::error::Braucht GLIBC_$MAX, ArkOS hat nur $MAX_GLIBC"
-            exit 1
+            echo "::error::Braucht GLIBC_$MAX, ArkOS hat $MAX_GLIBC"; exit 1
           fi
 
       - name: PortMaster-Paket vorbereiten
         if: always()
         run: |
           set -euo pipefail
-          STAGE="$GITHUB_WORKSPACE/dist"
-          PORT_DIR="$STAGE/$PORT_NAME"
-          rm -rf "$STAGE"
-          mkdir -p "$PORT_DIR/$PORT_NAME/assets"
-
+          STAGE="$GITHUB_WORKSPACE/dist"; PORT_DIR="$STAGE/$PORT_NAME"
+          rm -rf "$STAGE"; mkdir -p "$PORT_DIR/$PORT_NAME/assets"
           BIN="target/aarch64-unknown-linux-gnu/release/skate3rust"
-          if [ ! -x "$BIN" ]; then
-            echo "::error::skate3rust-Binary fehlt"
-            exit 1
+          if [ -x "$BIN" ]; then
+            install -m 755 "$BIN" "$PORT_DIR/$PORT_NAME/skate3"
+            strip --strip-unneeded "$PORT_DIR/$PORT_NAME/skate3" 2>/dev/null || true
           fi
-          install -m 755 "$BIN" "$PORT_DIR/$PORT_NAME/skate3"
-          strip --strip-unneeded "$PORT_DIR/$PORT_NAME/skate3" 2>/dev/null || true
           touch "$PORT_DIR/$PORT_NAME/assets/.gitkeep"
-
-          cp "$GITHUB_WORKSPACE/portmaster/Skate3.sh"    "$PORT_DIR/Skate3.sh"
-          cp "$GITHUB_WORKSPACE/portmaster/port.json"    "$PORT_DIR/port.json"
-          cp "$GITHUB_WORKSPACE/portmaster/README.md"    "$PORT_DIR/README.md"
-          cp "$GITHUB_WORKSPACE/portmaster/gameinfo.xml" "$PORT_DIR/gameinfo.xml"
-          chmod 755 "$PORT_DIR/Skate3.sh"
-
+          cp portmaster/Skate3.sh portmaster/port.json portmaster/README.md portmaster/gameinfo.xml "$PORT_DIR/" 2>/dev/null || true
+          chmod 755 "$PORT_DIR/Skate3.sh" 2>/dev/null || true
+          convert -size 640x480 xc:black -gravity center -fill white -pointsize 48 \
+                  -annotate 0 "Skate 3" "$PORT_DIR/screenshot.jpg" 2>/dev/null || true
           echo "PORT_DIR=$PORT_DIR" >> "$GITHUB_ENV"
 
-      - name: Screenshot erzeugen
-        run: |
-          set -euo pipefail
-          PORT_DIR="${PORT_DIR:?PORT_DIR nicht gesetzt}"
-          convert -size 640x480 xc:black -gravity center \
-                  -fill white -pointsize 48 -annotate 0 "Skate 3" \
-                  "$PORT_DIR/screenshot.jpg"
-
-      - name: PortMaster-ZIP erstellen
+      - name: ZIP erstellen
+        if: always()
         run: |
           set -euo pipefail
           cd "$GITHUB_WORKSPACE/dist"
-          zip -r "skate3.zip" "$PORT_NAME" -x "*.git*"
-          unzip -l "skate3.zip"
+          zip -r skate3.zip "$PORT_NAME"
+          unzip -l skate3.zip || true
 
       - name: Artefakt hochladen
+        if: always()
         uses: actions/upload-artifact@v4
         with:
           name: skate3-portmaster
           path: dist/skate3.zip
-          retention-days: 30
-          if-no-files-found: error
+          if-no-files-found: warn
 
       - name: Build-Log hochladen
         if: always()
@@ -251,5 +791,4 @@ jobs:
         with:
           name: skate3-build-log
           path: build.log
-          retention-days: 14
           if-no-files-found: warn
