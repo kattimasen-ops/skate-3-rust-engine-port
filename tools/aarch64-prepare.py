@@ -15,11 +15,6 @@ Wendet an:
  10. vendor/wgpu/wgpu-hal/src/gles/adapter.rs (Mali-G31 SSBO-Fix)
 
 Idempotent. Fehlschläge kritischer Patches → Exit 1.
-
-Aufruf:
-    python3 tools/aarch64-prepare.py
-    python3 tools/aarch64-prepare.py --check    # nur prüfen
-    python3 tools/aarch64-prepare.py --force    # existierende Dateien überschreiben
 """
 
 import argparse
@@ -61,10 +56,12 @@ def find_matching(text, open_idx, open_char='{', close_char='}'):
     i = open_idx
     while i < len(text):
         c = text[i]
-        if c == open_char: depth += 1
+        if c == open_char:
+            depth += 1
         elif c == close_char:
             depth -= 1
-            if depth == 0: return i
+            if depth == 0:
+                return i
         i += 1
     return -1
 
@@ -170,7 +167,8 @@ def patch_game_cargo(text):
     if "libc.workspace" in text or 'libc = "0.2"' in text:
         return text, False
     if "[dependencies]" in text:
-        text = text.replace("[dependencies]", "[dependencies]\nlibc.workspace = true", 1)
+        text = text.replace("[dependencies]",
+                            "[dependencies]\nlibc.workspace = true", 1)
     else:
         text += "\n[dependencies]\nlibc.workspace = true\n"
     return text, True
@@ -230,12 +228,10 @@ def prepare_main():
 def patch_app(text):
     changed = False
 
-    # Backends::VULKAN → GL
     if "Backends::VULKAN" in text:
         text = text.replace("Backends::VULKAN", "Backends::GL", 1)
         changed = True
 
-    # RenderCreation::Automatic(WgpuSettings { ... }) → Box::new(...)
     marker = "RenderCreation::Automatic(WgpuSettings"
     if marker in text:
         idx = text.find(marker)
@@ -248,24 +244,22 @@ def patch_app(text):
                 text = new_text
                 changed = True
 
-    # primary_window: Some(Window { ... }) → primary_window: None
     if "primary_window: Some" in text and "primary_window: None" not in text:
         idx = text.find("primary_window: Some")
         j = idx + len("primary_window: Some")
-        while j < len(text) and text[j] in ' \t': j += 1
+        while j < len(text) and text[j] in ' \t':
+            j += 1
         if j < len(text) and text[j] == '(':
             close = find_matching(text, j, '(', ')')
             if close > 0:
                 text = text[:idx] + "primary_window: None" + text[close + 1:]
                 changed = True
 
-    # exit_condition
     if "primary_window: None" in text and "ExitCondition::DontExit" not in text:
         text = text.replace("primary_window: None",
             "primary_window: None,\n            exit_condition: ExitCondition::DontExit", 1)
         changed = True
 
-    # .disable::<WinitPlugin>()
     if "disable::<WinitPlugin>" not in text and "disable::<bevy::winit::WinitPlugin>" not in text:
         if ".build()" in text:
             pos = text.find(".build()")
@@ -274,7 +268,6 @@ def patch_app(text):
         else:
             warn("app.rs: '.build()' fehlt – winit-disable nicht eingefügt")
 
-    # GpuPreprocessingSupport am Ende von build()
     if "GpuPreprocessingSupport" not in text:
         idx = text.find("fn build")
         if idx >= 0:
@@ -697,30 +690,71 @@ def prepare_portmaster():
 
 
 # ═════════════════════════════════════════════════════════════════════
-# 9. wgpu-Workspace-Vererbung fixen
+# 9. wgpu-Workspace-Vererbung fixen (nur [workspace.package]-Felder!)
 # ═════════════════════════════════════════════════════════════════════
-# Felder, die wgpu-Crates via `field.workspace = true` erben können.
+
+# Cargo erlaubt in [workspace.package] NUR diese Felder.
+# Dependencies wie `serde.workspace = true` gehören zu [workspace.dependencies]
+# und dürfen NICHT hier landen.
+CARGO_PACKAGE_INHERITABLE_FIELDS = {
+    "authors", "categories", "description", "documentation",
+    "edition", "exclude", "homepage", "include", "keywords",
+    "license", "license-file", "publish", "readme", "repository",
+    "rust-version", "version",
+}
+
+# Sinnvolle Defaults für den wgpu-v27-Kontext.
+# Werte, die wgpu v27 typischerweise setzt bzw. die Cargo akzeptiert.
 INHERITED_DEFAULTS = {
-    "authors": '["wgpu developers"]',
+    "authors": '["gfx-rs developers"]',
     "version": '"27.0.1"',
     "edition": '"2021"',
     "license": '"MIT OR Apache-2.0"',
     "repository": '"https://github.com/gfx-rs/wgpu"',
-    "rust-version": '"1.82"',
+    "rust-version": '"1.76"',
     "homepage": '"https://wgpu.rs/"',
+    "description": '"Wgpu is a safe and portable graphics library for Rust"',
+    "readme": '"README.md"',
+    "documentation": '"https://docs.rs/wgpu"',
 }
 
+
 def collect_used_inherited_fields():
-    """Sammelt alle Felder, die in vendor/wgpu/**.Cargo.toml per .workspace = true geerbt werden."""
+    """Sammelt NUR Package-Felder, die in vendor/wgpu/**.Cargo.toml
+    per `.workspace = true` geerbt werden.
+
+    Filtert mit CARGO_PACKAGE_INHERITABLE_FIELDS, damit Dependency-Namen wie
+    `serde.workspace = true` (das ist [workspace.dependencies], nicht
+    [workspace.package]) NICHT fälschlich als fehlende Package-Felder landen.
+    """
     used = set()
     pattern = re.compile(r"^([A-Za-z0-9_-]+)\.workspace\s*=\s*true", re.MULTILINE)
     for cargo_toml in WGPU_ROOT.rglob("Cargo.toml"):
         if cargo_toml == WGPU_ROOT / "Cargo.toml":
             continue
-        text = cargo_toml.read_text()
+        try:
+            text = cargo_toml.read_text()
+        except OSError:
+            continue
         for match in pattern.finditer(text):
-            used.add(match.group(1))
+            field = match.group(1)
+            if field in CARGO_PACKAGE_INHERITABLE_FIELDS:
+                used.add(field)
     return used
+
+
+def parse_workspace_package_fields(text):
+    """Liefert Set der in [workspace.package] definierten Felder."""
+    existing = set()
+    in_section = False
+    for line in text.splitlines():
+        s = line.strip()
+        if s.startswith("[") and s.endswith("]"):
+            in_section = (s == "[workspace.package]")
+            continue
+        if in_section and "=" in s and not s.startswith("#"):
+            existing.add(s.split("=", 1)[0].strip())
+    return existing
 
 
 def fix_wgpu_workspace():
@@ -735,47 +769,33 @@ def fix_wgpu_workspace():
         return
 
     used_fields = collect_used_inherited_fields()
-    log(f"  In wgpu-Crates via .workspace=true geerbt: {sorted(used_fields) or 'keine'}")
+    log(f"  Geerbte Package-Felder: {sorted(used_fields) or 'keine'}")
 
     if not used_fields:
         log("  Kein Handlungsbedarf")
         return
 
     text = wgpu_root_toml.read_text()
-
-    # Existiert [workspace.package]?
-    has_section = "[workspace.package]" in text
-
-    # Sammle bereits definierte Felder
-    existing = set()
-    if has_section:
-        in_section = False
-        for line in text.splitlines():
-            s = line.strip()
-            if s.startswith("[") and s.endswith("]"):
-                in_section = s == "[workspace.package]"
-                continue
-            if in_section and "=" in s and not s.startswith("#"):
-                existing.add(s.split("=")[0].strip())
-
+    existing = parse_workspace_package_fields(text)
     missing = used_fields - existing
+
     if not missing:
-        log(f"  Alle geerbten Felder bereits definiert ({len(existing)} Felder)")
+        log(f"  Alle {len(used_fields)} geerbten Felder bereits definiert")
         return
 
-    # Fehlende Felder aus Defaults hinzufügen
     to_add = {}
-    for field in missing:
+    for field in sorted(missing):
         if field in INHERITED_DEFAULTS:
             to_add[field] = INHERITED_DEFAULTS[field]
         else:
-            warn(f"  Unbekanntes geerbtes Feld: {field} – Default fehlt, wird übersprungen")
+            warn(f"  Feld '{field}' geerbt, aber kein Default bekannt – übersprungen")
 
     if not to_add:
+        log("  Keine Felder mit bekanntem Default zum Ergänzen")
         return
 
+    has_section = "[workspace.package]" in text
     if has_section:
-        # Felder in [workspace.package] einfügen (nach dem Header)
         lines = text.splitlines()
         insert_at = None
         for i, line in enumerate(lines):
@@ -790,8 +810,8 @@ def fix_wgpu_workspace():
             insert_at += 1
         new_text = "\n".join(lines) + "\n"
     else:
-        # Kompletter [workspace.package]-Block neu
-        block = "\n[workspace.package]\n" + "\n".join(f"{k} = {v}" for k, v in to_add.items()) + "\n"
+        block = "\n[workspace.package]\n" + "\n".join(
+            f"{k} = {v}" for k, v in to_add.items()) + "\n"
         if "[workspace]" in text:
             new_text = text.replace("[workspace]", "[workspace]" + block, 1)
         else:
@@ -802,7 +822,7 @@ def fix_wgpu_workspace():
         return
 
     wgpu_root_toml.write_text(new_text)
-    log(f"  ergänzt in [workspace.package]: {sorted(to_add.keys())}")
+    log(f"  ergänzt: {sorted(to_add.keys())}")
 
 
 def verify_wgpu_workspace():
@@ -814,23 +834,17 @@ def verify_wgpu_workspace():
         log("  OK (keine Vererbung)")
         return
     wgpu_root_toml = WGPU_ROOT / "Cargo.toml"
+    if not wgpu_root_toml.exists():
+        fail("wgpu-root Cargo.toml fehlt")
+        return
     text = wgpu_root_toml.read_text()
-    # Parse definierte Felder
-    existing = set()
-    in_section = False
-    for line in text.splitlines():
-        s = line.strip()
-        if s.startswith("[") and s.endswith("]"):
-            in_section = s == "[workspace.package]"
-            continue
-        if in_section and "=" in s and not s.startswith("#"):
-            existing.add(s.split("=")[0].strip())
+    existing = parse_workspace_package_fields(text)
     missing = used - existing
     if missing:
         for f in sorted(missing):
             fail(f"  Feld '{f}' geerbt aber nicht definiert")
     else:
-        log(f"  OK: alle {len(used)} geerbten Felder definiert")
+        log(f"  OK: alle {len(used)} geerbten Package-Felder definiert")
 
 
 # ═════════════════════════════════════════════════════════════════════
@@ -848,7 +862,6 @@ def patch_wgpu_adapter():
         log("  bereits gepatcht")
         return
 
-    # Regex toleriert Whitespace/Newlines
     pattern = re.compile(
         r'let\s+max_storage_buffers_per_shader_stage\s*=\s*'
         r'if\s+vertex_shader_storage_blocks\s*==\s*0\s*\{\s*'
@@ -872,7 +885,6 @@ def patch_wgpu_adapter():
     new_text, n = pattern.subn(replacement, text, count=1)
     if n == 0:
         fail("adapter.rs: Muster für max_storage_buffers_per_shader_stage nicht gefunden")
-        # Diagnose
         for i, line in enumerate(text.splitlines(), 1):
             if "max_storage_buffers_per_shader_stage" in line:
                 print(f"  Zeile {i}: {line!r}", file=sys.stderr)
