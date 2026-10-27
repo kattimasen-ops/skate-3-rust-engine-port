@@ -12,11 +12,8 @@ Wendet an:
   6. fb0_writer.rs (nur wenn fehlt)
   7. headless_plugin.rs (nur wenn fehlt)
   8. portmaster/ (nur wenn fehlt oder --force)
-  9. vendor/wgpu: [package]-Vererbung hart auflösen (authors, edition, ...)
- 10. vendor/wgpu: [dependencies]-Vererbung hart auflösen
-     - Form 1: dep.workspace = true
-     - Form 2: dep = { workspace = true, ... }
-     - Pfad-Dependencies werden relativ zum vendorten Crate korrekt gesetzt
+  9. vendor/wgpu: [package]-Vererbung hart auflösen
+ 10. vendor/wgpu: [dependencies]-Vererbung hart auflösen (via tomlkit)
  11. vendor/wgpu/wgpu-hal/src/gles/adapter.rs (Mali-G31 SSBO-Fix)
 
 Idempotent. Fehlschläge kritischer Patches → Exit 1.
@@ -25,6 +22,7 @@ Idempotent. Fehlschläge kritischer Patches → Exit 1.
 import argparse
 import os
 import re
+import subprocess
 import sys
 from pathlib import Path
 
@@ -52,6 +50,25 @@ def warn(msg):
 def fail(msg):
     errors.append(msg)
     print(f"[prepare] FEHLER: {msg}", file=sys.stderr)
+
+
+def ensure_tomlkit():
+    """Importiert tomlkit; installiert es bei Bedarf via pip."""
+    try:
+        import tomlkit
+        return tomlkit
+    except ImportError:
+        log("Installiere tomlkit via pip...")
+        try:
+            subprocess.check_call(
+                [sys.executable, "-m", "pip", "install", "--quiet", "tomlkit"],
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            )
+            import tomlkit
+            return tomlkit
+        except Exception as e:
+            fail(f"tomlkit konnte nicht installiert werden: {e}")
+            return None
 
 
 def find_matching(text, open_idx, open_char='{', close_char='}'):
@@ -237,12 +254,10 @@ def prepare_main():
 def patch_app(text):
     changed = False
 
-    # 5a. Backends::VULKAN -> GL
     if "Backends::VULKAN" in text:
         text = text.replace("Backends::VULKAN", "Backends::GL", 1)
         changed = True
 
-    # 5b. RenderCreation::Automatic(WgpuSettings -> Box::new(...)
     marker = "RenderCreation::Automatic(WgpuSettings"
     if marker in text:
         idx = text.find(marker)
@@ -255,7 +270,6 @@ def patch_app(text):
                 text = new_text
                 changed = True
 
-    # 5c. primary_window: Some(...) -> None
     if "primary_window: Some" in text and "primary_window: None" not in text:
         idx = text.find("primary_window: Some")
         j = idx + len("primary_window: Some")
@@ -267,13 +281,11 @@ def patch_app(text):
                 text = text[:idx] + "primary_window: None" + text[close + 1:]
                 changed = True
 
-    # 5d. exit_condition: ExitCondition::DontExit
     if "primary_window: None" in text and "ExitCondition::DontExit" not in text:
         text = text.replace("primary_window: None",
             "primary_window: None,\n            exit_condition: ExitCondition::DontExit", 1)
         changed = True
 
-    # 5e. WinitPlugin deaktivieren
     if "disable::<WinitPlugin>" not in text and "disable::<bevy::winit::WinitPlugin>" not in text:
         if ".build()" in text:
             pos = text.find(".build()")
@@ -282,7 +294,6 @@ def patch_app(text):
         else:
             warn("app.rs: '.build()' fehlt – winit-disable nicht eingefügt")
 
-    # 5f. ScheduleRunnerPlugin nach dem DefaultPlugins-Block
     if "ScheduleRunnerPlugin" not in text:
         m = re.search(r'app\.add_plugins\s*\(\s*\n?\s*DefaultPlugins', text)
         if m:
@@ -304,7 +315,6 @@ def patch_app(text):
         else:
             warn("app.rs: 'app.add_plugins(DefaultPlugins' nicht gefunden")
 
-    # 5g. GpuPreprocessingSupport vor `app }`
     if "GpuPreprocessingSupport" not in text:
         idx = text.find("fn build")
         if idx >= 0:
@@ -727,7 +737,7 @@ def prepare_portmaster():
 
 
 # ═════════════════════════════════════════════════════════════════════
-# 9. wgpu [package]-Vererbung hart auflösen
+# 9. wgpu [package]-Vererbung hart auflösen (via tomlkit)
 # ═════════════════════════════════════════════════════════════════════
 PACKAGE_INHERITABLE = {
     "authors", "categories", "description", "documentation",
@@ -747,28 +757,12 @@ DEFAULTS = {
 }
 
 
-def parse_workspace_package(root_text):
-    values = {}
-    in_section = False
-    for line in root_text.splitlines():
-        stripped = line.strip()
-        if stripped.startswith("[") and stripped.endswith("]"):
-            in_section = (stripped == "[workspace.package]")
-            continue
-        if not in_section or not stripped or stripped.startswith("#"):
-            continue
-        if "=" not in stripped:
-            continue
-        key, _, val = stripped.partition("=")
-        key = key.strip()
-        val = val.strip()
-        if key in PACKAGE_INHERITABLE:
-            values[key] = val
-    return values
-
-
 def resolve_package_inheritance():
     log("== wgpu [package]-Vererbung hart auflösen ==")
+    tomlkit = ensure_tomlkit()
+    if tomlkit is None:
+        fail("tomlkit fehlt – kann [package]-Vererbung nicht auflösen")
+        return
     if not WGPU_ROOT.exists():
         warn(f"{WGPU_ROOT.relative_to(ROOT)} fehlt – wgpu nicht geklont?")
         return
@@ -778,120 +772,140 @@ def resolve_package_inheritance():
         fail(f"{root_toml.relative_to(ROOT)} fehlt")
         return
 
-    root_values = parse_workspace_package(root_toml.read_text())
-    for key, val in DEFAULTS.items():
-        root_values.setdefault(key, val)
+    try:
+        root_doc = tomlkit.parse(root_toml.read_text())
+    except Exception as e:
+        fail(f"wgpu/Cargo.toml nicht parsebar: {e}")
+        return
 
-    root_text = root_toml.read_text()
-    existing = parse_workspace_package(root_text)
-    missing_in_root = {k: v for k, v in root_values.items() if k not in existing}
+    workspace_pkg = root_doc.get("workspace", {}).get("package", {})
 
-    if missing_in_root:
-        if "[workspace.package]" not in root_text:
-            block = "\n[workspace.package]\n" + "\n".join(
-                f"{k} = {v}" for k, v in missing_in_root.items()) + "\n"
-            if "[workspace]" in root_text:
-                root_text = root_text.replace("[workspace]", "[workspace]" + block, 1)
-            else:
-                root_text = "[workspace]\n" + block + "\n" + root_text
-        else:
-            lines = root_text.splitlines()
-            insert_at = None
-            for i, line in enumerate(lines):
-                if line.strip() == "[workspace.package]":
-                    insert_at = i + 1
-                    break
-            if insert_at is not None:
-                for k, v in missing_in_root.items():
-                    lines.insert(insert_at, f"{k} = {v}")
-                    insert_at += 1
-                root_text = "\n".join(lines) + "\n"
+    # Konkrete Werte aus root, mit Defaults für bekannte Felder
+    root_values = {}
+    for k, v in workspace_pkg.items():
+        if k in PACKAGE_INHERITABLE:
+            root_values[k] = v
+    for k, v in DEFAULTS.items():
+        if k not in root_values:
+            try:
+                root_values[k] = tomlkit.parse(f"v = {v}")["v"]
+            except Exception:
+                pass
+
+    # Root ergänzen
+    if "workspace" not in root_doc:
+        root_doc["workspace"] = tomlkit.table()
+    if "package" not in root_doc["workspace"]:
+        root_doc["workspace"]["package"] = tomlkit.table()
+    missing_root = {k: v for k, v in root_values.items() if k not in workspace_pkg}
+    if missing_root:
+        for k, v in missing_root.items():
+            root_doc["workspace"]["package"][k] = v
         if not CHECK_ONLY:
-            root_toml.write_text(root_text)
-        log(f"  Root [workspace.package] ergänzt: {sorted(missing_in_root)}")
+            root_toml.write_text(tomlkit.dumps(root_doc))
+        log(f"  Root [workspace.package] ergänzt: {sorted(missing_root)}")
 
-    pattern = re.compile(
-        r'^(\s*)([A-Za-z0-9_-]+)\.workspace\s*=\s*true\s*$',
-        re.MULTILINE,
-    )
-
+    # Jede vendorte Cargo.toml durchgehen
     total_files = 0
     total_fields = 0
-
     for cargo_toml in sorted(WGPU_ROOT.rglob("Cargo.toml")):
         if cargo_toml == root_toml:
             continue
-        text = cargo_toml.read_text()
+        try:
+            doc = tomlkit.parse(cargo_toml.read_text())
+        except Exception as e:
+            warn(f"  {cargo_toml.relative_to(ROOT)}: nicht parsebar: {e}")
+            continue
 
-        def replace_line(m):
-            nonlocal total_fields
-            indent, field = m.group(1), m.group(2)
-            if field not in PACKAGE_INHERITABLE:
-                return m.group(0)
-            if field not in root_values:
-                warn(f"  {cargo_toml.relative_to(ROOT)}: Feld '{field}' unbekannt")
-                return m.group(0)
-            total_fields += 1
-            return f"{indent}{field} = {root_values[field]}"
+        if "package" not in doc:
+            continue
 
-        new_text, n = pattern.subn(replace_line, text)
-        if n > 0 and new_text != text:
+        pkg = doc["package"]
+        modified = False
+        for field in list(pkg.keys()):
+            if not hasattr(pkg[field], "get"):
+                continue
+            if not (isinstance(pkg[field], dict) or hasattr(pkg[field], "get")):
+                continue
+            try:
+                if pkg[field].get("workspace") is True:
+                    if field in root_values:
+                        pkg[field] = root_values[field]
+                        modified = True
+                        total_fields += 1
+            except Exception:
+                continue
+
+        if modified:
             if not CHECK_ONLY:
-                cargo_toml.write_text(new_text)
-            log(f"  {cargo_toml.relative_to(ROOT)}: {n} Zeile(n) aufgelöst")
+                cargo_toml.write_text(tomlkit.dumps(doc))
+            log(f"  {cargo_toml.relative_to(ROOT)}: package-Felder aufgelöst")
             total_files += 1
 
     log(f"  {total_files} Datei(en), {total_fields} Feld(er) aufgelöst")
 
 
 # ═════════════════════════════════════════════════════════════════════
-# 10. wgpu [dependencies]-Vererbung hart auflösen
+# 10. wgpu [dependencies]-Vererbung hart auflösen (via tomlkit)
 # ═════════════════════════════════════════════════════════════════════
-def parse_workspace_dependencies(root_text):
-    """Parst [workspace.dependencies]. Gibt dict dep_name -> roher TOML-Wert."""
-    deps = {}
-    in_section = False
-    for line in root_text.splitlines():
-        stripped = line.strip()
-        if stripped.startswith("[") and stripped.endswith("]"):
-            in_section = (stripped == "[workspace.dependencies]")
-            continue
-        if not in_section or not stripped or stripped.startswith("#"):
-            continue
-        if "=" not in stripped:
-            continue
-        key, _, val = stripped.partition("=")
-        key = key.strip()
-        val = val.strip()
-        deps[key] = val
-    return deps
-
-
 def adjust_path_for_vendored(dep_value, vendored_crate_dir, wgpu_root):
     """Passe path = "..." in dep_value so an, dass er relativ zum vendorten
-    Crate korrekt aufgelöst wird."""
-    m = re.search(r'path\s*=\s*"([^"]+)"', dep_value)
-    if not m:
+    Crate korrekt aufgelöst wird. dep_value ist ein dict."""
+    if not isinstance(dep_value, dict):
         return dep_value
-
-    original_path = m.group(1)
+    if "path" not in dep_value:
+        return dep_value
     try:
-        abs_path = (wgpu_root / original_path).resolve()
+        original = str(dep_value["path"])
+        abs_path = (wgpu_root / original).resolve()
         rel_path = os.path.relpath(abs_path, vendored_crate_dir.resolve())
+        new_path = rel_path.replace(os.sep, "/")
+        if not new_path.startswith("."):
+            new_path = "./" + new_path
+        dep_value["path"] = new_path
     except (ValueError, OSError):
-        return dep_value
+        pass
+    return dep_value
 
-    new_path = rel_path.replace(os.sep, "/")
-    if not new_path.startswith("."):
-        new_path = "./" + new_path
 
-    return dep_value[:m.start()] + f'path = "{new_path}"' + dep_value[m.end():]
+def merge_dep_spec(tomlkit, base, spec, vendored_dir, wgpu_root):
+    """Führt base (aus workspace.dependencies) und spec (aus crate) zusammen.
+    spec enthält 'workspace': true, das entfernt wird."""
+    # spec ohne 'workspace' extrahieren
+    spec_extra = {}
+    for k in spec.keys():
+        if k != "workspace":
+            spec_extra[k] = spec[k]
+
+    # base kann ein String (Version) oder ein dict (Tabelle) sein
+    if isinstance(base, str):
+        if spec_extra:
+            # Tabelle bauen: version + extras
+            result = tomlkit.inline_table()
+            result["version"] = base
+            for k, v in spec_extra.items():
+                result[k] = v
+            return adjust_path_for_vendored(result, vendored_dir, wgpu_root)
+        else:
+            return base
+    else:
+        # base ist dict (tomlkit Table oder InlineTable)
+        result = tomlkit.inline_table()
+        for k, v in base.items():
+            result[k] = v
+        for k, v in spec_extra.items():
+            result[k] = v
+        return adjust_path_for_vendored(result, vendored_dir, wgpu_root)
 
 
 def resolve_dependency_inheritance():
-    log("== wgpu [dependencies]-Vererbung hart auflösen ==")
+    log("== wgpu [dependencies]-Vererbung hart auflösen (tomlkit) ==")
+    tomlkit = ensure_tomlkit()
+    if tomlkit is None:
+        fail("tomlkit fehlt – kann [dependencies]-Vererbung nicht auflösen")
+        return
     if not WGPU_ROOT.exists():
-        warn(f"{WGPU_ROOT.relative_to(ROOT)} fehlt – wgpu nicht geklont?")
+        warn(f"{WGPU_ROOT.relative_to(ROOT)} fehlt")
         return
 
     root_toml = WGPU_ROOT / "Cargo.toml"
@@ -899,19 +913,14 @@ def resolve_dependency_inheritance():
         fail(f"{root_toml.relative_to(ROOT)} fehlt")
         return
 
-    root_deps = parse_workspace_dependencies(root_toml.read_text())
-    log(f"  Workspace-Dependencies: {len(root_deps)} Einträge")
+    try:
+        root_doc = tomlkit.parse(root_toml.read_text())
+    except Exception as e:
+        fail(f"wgpu/Cargo.toml nicht parsebar: {e}")
+        return
 
-    # Form 1: dep.workspace = true (ganze Zeile)
-    pattern_dot = re.compile(
-        r'^(\s*)([A-Za-z0-9_-]+)\.workspace\s*=\s*true\s*$',
-        re.MULTILINE,
-    )
-    # Form 2: dep = { workspace = true, ... }
-    pattern_inline = re.compile(
-        r'^(\s*)([A-Za-z0-9_-]+)\s*=\s*\{\s*workspace\s*=\s*true\s*,?\s*([^}]*)\}\s*$',
-        re.MULTILINE,
-    )
+    workspace_deps = root_doc.get("workspace", {}).get("dependencies", {})
+    log(f"  Workspace-Dependencies: {len(workspace_deps)} Einträge")
 
     total_files = 0
     total_fields = 0
@@ -920,99 +929,105 @@ def resolve_dependency_inheritance():
     for cargo_toml in sorted(WGPU_ROOT.rglob("Cargo.toml")):
         if cargo_toml == root_toml:
             continue
-        text = cargo_toml.read_text()
-        vendored_crate_dir = cargo_toml.parent
+        try:
+            doc = tomlkit.parse(cargo_toml.read_text())
+        except Exception as e:
+            warn(f"  {cargo_toml.relative_to(ROOT)}: nicht parsebar: {e}")
+            continue
 
-        # ── Form 1: dep.workspace = true ────────────────────────────
-        def replace_dot(m):
-            nonlocal total_fields, missing
-            indent, dep = m.group(1), m.group(2)
-            if dep not in root_deps:
-                missing.append((cargo_toml.relative_to(ROOT), dep))
-                return m.group(0)
-            val = adjust_path_for_vendored(root_deps[dep], vendored_crate_dir, WGPU_ROOT)
-            total_fields += 1
-            return f"{indent}{dep} = {val}"
+        vendored_dir = cargo_toml.parent
+        modified = False
 
-        text, n_dot = pattern_dot.subn(replace_dot, text)
+        # Alle dependency-Sektionen: dependencies, dev-dependencies, build-dependencies
+        # und target.*.dependencies
+        sections = []
+        for sec_name in ("dependencies", "dev-dependencies", "build-dependencies"):
+            if sec_name in doc:
+                sections.append((sec_name, doc[sec_name]))
+        if "target" in doc:
+            for target_name in doc["target"].keys():
+                target_data = doc["target"][target_name]
+                for sec_name in ("dependencies", "dev-dependencies", "build-dependencies"):
+                    if sec_name in target_data:
+                        sections.append((f"target.{target_name}.{sec_name}", target_data[sec_name]))
 
-        # ── Form 2: dep = { workspace = true, ... } ─────────────────
-        def replace_inline(m):
-            nonlocal total_fields, missing
-            indent, dep, extra = m.group(1), m.group(2), m.group(3).strip()
-            if dep not in root_deps:
-                missing.append((cargo_toml.relative_to(ROOT), dep))
-                return m.group(0)
-            base = root_deps[dep]
+        for sec_path, section in sections:
+            for dep_name in list(section.keys()):
+                spec = section[dep_name]
+                # Nur inline tables die 'workspace = true' haben
+                if not hasattr(spec, "get"):
+                    continue
+                if spec.get("workspace") is not True:
+                    continue
 
-            if base.startswith("{") and base.endswith("}"):
-                inner = base[1:-1].strip()
-                inner = re.sub(r'\bworkspace\s*=\s*true\s*,?\s*', '', inner)
-                if extra:
-                    extra = extra.rstrip(",").strip()
-                    inner = inner + ", " + extra if inner else extra
-                val = "{ " + inner + " }"
-            else:
-                if extra:
-                    val = "{ version = " + base + ", " + extra.rstrip(",") + " }"
-                else:
-                    val = base
+                if dep_name not in workspace_deps:
+                    missing.append((cargo_toml.relative_to(ROOT), dep_name))
+                    continue
 
-            val = adjust_path_for_vendored(val, vendored_crate_dir, WGPU_ROOT)
-            total_fields += 1
-            return f"{indent}{dep} = {val}"
+                base = workspace_deps[dep_name]
+                try:
+                    section[dep_name] = merge_dep_spec(
+                        tomlkit, base, spec, vendored_dir, WGPU_ROOT
+                    )
+                    modified = True
+                    total_fields += 1
+                except Exception as e:
+                    warn(f"  {cargo_toml.relative_to(ROOT)}: {dep_name}: {e}")
 
-        text, n_inline = pattern_inline.subn(replace_inline, text)
-
-        n_total = n_dot + n_inline
-        if n_total > 0:
+        if modified:
             if not CHECK_ONLY:
-                cargo_toml.write_text(text)
-            log(f"  {cargo_toml.relative_to(ROOT)}: {n_total} Zeile(n) aufgelöst "
-                f"(dot={n_dot}, inline={n_inline})")
+                try:
+                    cargo_toml.write_text(tomlkit.dumps(doc))
+                except Exception as e:
+                    fail(f"  {cargo_toml.relative_to(ROOT)}: schreiben fehlgeschlagen: {e}")
+                    continue
+            log(f"  {cargo_toml.relative_to(ROOT)}: dependencies aufgelöst")
             total_files += 1
 
     if missing:
         for path, dep in missing:
-            warn(f"  {path}: Dependency '{dep}' nicht in [workspace.dependencies]")
+            warn(f"  {path}: '{dep}' nicht in [workspace.dependencies]")
     log(f"  {total_files} Datei(en), {total_fields} Feld(er) aufgelöst")
 
 
 def verify_dependency_inheritance():
     log("== wgpu [dependencies]-Vererbung verifizieren ==")
-    if not WGPU_ROOT.exists():
+    tomlkit = ensure_tomlkit()
+    if tomlkit is None or not WGPU_ROOT.exists():
         return
     root_toml = WGPU_ROOT / "Cargo.toml"
     if not root_toml.exists():
-        fail("wgpu-root Cargo.toml fehlt")
         return
-    root_deps = parse_workspace_dependencies(root_toml.read_text())
-
-    pattern_dot = re.compile(
-        r'^\s*([A-Za-z0-9_-]+)\.workspace\s*=\s*true\s*$',
-        re.MULTILINE,
-    )
-    pattern_inline = re.compile(
-        r'^\s*([A-Za-z0-9_-]+)\s*=\s*\{\s*workspace\s*=\s*true',
-        re.MULTILINE,
-    )
-
     bad = []
     for cargo_toml in sorted(WGPU_ROOT.rglob("Cargo.toml")):
         if cargo_toml == root_toml:
             continue
-        text = cargo_toml.read_text()
-        for m in pattern_dot.finditer(text):
-            dep = m.group(1)
-            if dep in root_deps:
-                bad.append((cargo_toml.relative_to(ROOT), dep, "dot"))
-        for m in pattern_inline.finditer(text):
-            dep = m.group(1)
-            if dep in root_deps:
-                bad.append((cargo_toml.relative_to(ROOT), dep, "inline"))
+        try:
+            doc = tomlkit.parse(cargo_toml.read_text())
+        except Exception as e:
+            fail(f"  {cargo_toml.relative_to(ROOT)}: nicht parsebar nach Patch: {e}")
+            continue
+
+        sections = []
+        for sec_name in ("dependencies", "dev-dependencies", "build-dependencies"):
+            if sec_name in doc:
+                sections.append(doc[sec_name])
+        if "target" in doc:
+            for target_name in doc["target"].keys():
+                target_data = doc["target"][target_name]
+                for sec_name in ("dependencies", "dev-dependencies", "build-dependencies"):
+                    if sec_name in target_data:
+                        sections.append(target_data[sec_name])
+
+        for section in sections:
+            for dep_name in section.keys():
+                spec = section[dep_name]
+                if hasattr(spec, "get") and spec.get("workspace") is True:
+                    bad.append((cargo_toml.relative_to(ROOT), dep_name))
+
     if bad:
-        for path, dep, kind in bad:
-            fail(f"  {path}: '{dep}' ({kind}) noch nicht aufgelöst")
+        for path, dep in bad:
+            fail(f"  {path}: '{dep}' noch nicht aufgelöst")
     else:
         log("  OK: keine Dependency-Vererbung mehr vorhanden")
 
