@@ -1,0 +1,16 @@
+--- a/wgpu-hal/src/gles/adapter.rs
++++ b/wgpu-hal/src/gles/adapter.rs
+@@ -371,9 +371,15 @@
+         let max_storage_buffers_per_shader_stage = if vertex_shader_storage_blocks == 0 {
+-            fragment_shader_storage_blocks
++            if vertex_ssbo_false_zero {
++                // RPI4-Fall: Vertex-SSBO=0 ist eine Lüge, Fragment-Wert nutzen
++                fragment_shader_storage_blocks
++            } else {
++                // Mali-G31 (libmali r13p0): 0 SSBO in ALLEN Stages.
++                // Bevy muss auf Uniform-Fallback (WebGL2-Pfad) umschalten.
++                0
++            }
+         } else {
+             vertex_shader_storage_blocks.min(fragment_shader_storage_blocks)
+         };
