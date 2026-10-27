@@ -250,7 +250,6 @@ jobs:
           echo ""
           echo "== Manuelle-Kleinigkeiten-Patches =="
 
-          # fetch_update → try_update: keine .fetch_update( mehr in crates/
           if grep -rEq '\.fetch_update\s*\(' crates/ 2>/dev/null; then
             echo "  FEHLER: .fetch_update( noch vorhanden (Prepare hat nicht ersetzt)"
             grep -rEn '\.fetch_update\s*\(' crates/ || true
@@ -258,19 +257,6 @@ jobs:
           fi
           echo "  OK: keine .fetch_update( mehr"
 
-          # XinputCaps-Zustand prüfen.
-          #
-          # GÜLTIG:
-          #   (a) Import + echte Code-Nutzung    -> import=1 uses>=1
-          #   (b) Import + nur Kommentar-Nutzung -> import=1 uses>=1 (Warnung erlaubt, Compiler entscheidet)
-          #   (c) Weder Import noch Nutzung      -> import=0 uses=0
-          #
-          # FEHLER:
-          #   (d) Import vorhanden, aber NIRGENDS referenziert
-          #       -> Prepare hätte ihn entfernen sollen; hier fail.
-          #   (e) Import fehlt, aber Nutzung außerhalb Kommentar
-          #       -> Compiler fängt das als Fehler; hier nur WARNUNG,
-          #          damit ein Kommentar-Vorkommen keinen False Positive gibt.
           PLATFORM_FILE=crates/skate-game/src/input/platform.rs
           if [ -f "$PLATFORM_FILE" ]; then
             XINPUT_TOTAL=$(grep -c '\bXinputCaps\b' "$PLATFORM_FILE" 2>/dev/null || true)
@@ -297,6 +283,30 @@ jobs:
           else
             echo "  FEHLT: dead_code = allow in [lints.rust]"
             grep -n 'lints' crates/skate-game/Cargo.toml || true
+            exit 1
+          fi
+
+          echo ""
+          echo "== mimalloc als global_allocator =="
+          if grep -q 'mimalloc::MiMalloc' crates/skate-game/src/main.rs; then
+            echo "  OK: mimalloc::MiMalloc in main.rs"
+          else
+            echo "  FEHLER: mimalloc global_allocator fehlt in main.rs"
+            grep -n 'global_allocator\|mimalloc' crates/skate-game/src/main.rs || true
+            exit 1
+          fi
+          if grep -q 'mimalloc.workspace = true' crates/skate-game/Cargo.toml; then
+            echo "  OK: mimalloc.workspace in skate-game/Cargo.toml"
+          else
+            echo "  FEHLER: mimalloc.workspace fehlt in skate-game/Cargo.toml"
+            grep -n 'mimalloc' crates/skate-game/Cargo.toml || true
+            exit 1
+          fi
+          if grep -q 'mimalloc = "0.1"' Cargo.toml; then
+            echo "  OK: mimalloc = \"0.1\" in Root-Cargo.toml"
+          else
+            echo "  FEHLER: mimalloc fehlt in Root-Cargo.toml [workspace.dependencies]"
+            grep -n 'mimalloc' Cargo.toml || true
             exit 1
           fi
 
