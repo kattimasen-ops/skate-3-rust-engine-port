@@ -7,7 +7,7 @@ Wendet an:
   2. Root-Cargo.toml (libc; ALLE wgpu-* + naga als Pfad-Patches)
   3. skate-game/Cargo.toml (libc, default = [])
   4. main.rs (Module, WGPU-Env, HeadlessFbPlugin)
-  5. app.rs (Backends::GL, primary_window: None, winit-disable,
+  5. app.rs (Backends::GL, primary_window: None, winit-disable nach .build(),
              ScheduleRunnerPlugin, GPU-Preproc, ExitCondition)
   6. fb0_writer.rs (nur wenn fehlt)
   7. headless_plugin.rs (nur wenn fehlt)
@@ -16,7 +16,7 @@ Wendet an:
  10. vendor/wgpu: [dependencies]-Vererbung hart auflösen (via tomlkit)
  11. vendor/wgpu/wgpu-hal/Cargo.toml: naga mit termcolor-Feature
  12. vendor/wgpu/wgpu-hal/src/gles/adapter.rs (Mali-G31 SSBO-Fix)
- 13. vendor/wgpu/wgpu-hal Version verifizieren (27.0.4)
+ 13. wgpu-hal Version verifizieren (27.0.4)
 
 Idempotent. Fehlschläge kritischer Patches → Exit 1.
 """
@@ -284,18 +284,34 @@ def patch_app(text):
         text = text.replace("Backends::VULKAN", "Backends::GL", 1)
         changed = True
 
-    marker = "RenderCreation::Automatic(WgpuSettings"
-    if marker in text:
-        idx = text.find(marker)
-        new_text = text[:idx] + "RenderCreation::Automatic(Box::new(WgpuSettings" + text[idx + len(marker):]
-        auto_start = idx + len("RenderCreation::Automatic")
-        if auto_start < len(new_text) and new_text[auto_start] == '(':
-            close = find_matching(new_text, auto_start, '(', ')')
-            if close > 0:
-                new_text = new_text[:close] + ")" + new_text[close:]
-                text = new_text
-                changed = True
+    # ── Box::new um WgpuSettings ────────────────────────────────────
+    # WICHTIG: ZUERST Klammer matchen, DANN einfügen. Die alte Logik
+    # hat zuerst "Box::new(" eingefügt und dann mit verschobenen
+    # Indizes gematcht → landete bei der falschen schließenden Klammer.
+    if ("Automatic(WgpuSettings" in text
+            and "Automatic(Box::new(WgpuSettings" not in text):
+        idx = text.find("RenderCreation::Automatic(")
+        if idx >= 0:
+            paren_open = idx + len("RenderCreation::Automatic")
+            if paren_open < len(text) and text[paren_open] == '(':
+                close = find_matching(text, paren_open, '(', ')')
+                if close > 0:
+                    text = (
+                        text[:paren_open + 1]
+                        + "Box::new("
+                        + text[paren_open + 1:close]
+                        + ")"
+                        + text[close:]
+                    )
+                    changed = True
+                else:
+                    warn("app.rs: Automatic(...) Klammer nicht geschlossen")
+            else:
+                warn("app.rs: '(' nach 'RenderCreation::Automatic' fehlt")
+        else:
+            warn("app.rs: 'RenderCreation::Automatic(' nicht gefunden")
 
+    # ── primary_window: Some(Window{...}) → None ────────────────────
     if "primary_window: Some" in text and "primary_window: None" not in text:
         idx = text.find("primary_window: Some")
         j = idx + len("primary_window: Some")
@@ -307,7 +323,7 @@ def patch_app(text):
                 text = text[:idx] + "primary_window: None" + text[close + 1:]
                 changed = True
 
-    # ExitCondition unabhängig vom primary_window-Zustand einfügen
+    # ── exit_condition: ExitCondition::DontExit ─────────────────────
     if "ExitCondition::DontExit" not in text:
         anchor = "primary_window: None"
         idx = text.find(anchor)
@@ -317,21 +333,31 @@ def patch_app(text):
             while j < len(text) and text[j] in ' \t\n':
                 j += 1
             if j < len(text) and text[j] == ',':
-                text = text[:j+1] + "\n            exit_condition: ExitCondition::DontExit," + text[j+1:]
+                text = (text[:j + 1]
+                        + "\n            exit_condition: ExitCondition::DontExit,"
+                        + text[j + 1:])
             else:
-                text = text[:insert_at] + ",\n            exit_condition: ExitCondition::DontExit" + text[insert_at:]
+                text = (text[:insert_at]
+                        + ",\n            exit_condition: ExitCondition::DontExit"
+                        + text[insert_at:])
             changed = True
         else:
             warn("app.rs: 'primary_window: None' fehlt – exit_condition nicht eingefügt")
 
-    if "disable::<WinitPlugin>" not in text and "disable::<bevy::winit::WinitPlugin>" not in text:
+    # ── Winit-disable: NACH .build(), nicht davor ──────────────────
+    if ("disable::<WinitPlugin>" not in text
+            and "disable::<bevy::winit::WinitPlugin>" not in text):
         if ".build()" in text:
             pos = text.find(".build()")
-            text = text[:pos] + ".disable::<bevy::winit::WinitPlugin>()\n        " + text[pos:]
+            insert_at = pos + len(".build()")
+            text = (text[:insert_at]
+                    + ".disable::<bevy::winit::WinitPlugin>()"
+                    + text[insert_at:])
             changed = True
         else:
             warn("app.rs: '.build()' fehlt – winit-disable nicht eingefügt")
 
+    # ── ScheduleRunnerPlugin ────────────────────────────────────────
     if "ScheduleRunnerPlugin" not in text:
         m = re.search(r'app\.add_plugins\s*\(\s*\n?\s*DefaultPlugins', text)
         if m:
@@ -353,6 +379,7 @@ def patch_app(text):
         else:
             warn("app.rs: 'app.add_plugins(DefaultPlugins' nicht gefunden")
 
+    # ── GpuPreprocessingSupport ─────────────────────────────────────
     if "GpuPreprocessingSupport" not in text:
         idx = text.find("fn build")
         if idx >= 0:
@@ -818,7 +845,6 @@ def resolve_package_inheritance():
 
     workspace_pkg = root_doc.get("workspace", {}).get("package", {})
 
-    # Konkrete Werte aus root, mit Defaults für bekannte Felder
     root_values = {}
     for k, v in workspace_pkg.items():
         if k in PACKAGE_INHERITABLE:
@@ -830,7 +856,6 @@ def resolve_package_inheritance():
             except Exception:
                 pass
 
-    # Root ergänzen
     if "workspace" not in root_doc:
         root_doc["workspace"] = tomlkit.table()
     if "package" not in root_doc["workspace"]:
@@ -843,7 +868,6 @@ def resolve_package_inheritance():
             root_toml.write_text(tomlkit.dumps(root_doc))
         log(f"  Root [workspace.package] ergänzt: {sorted(missing_root)}")
 
-    # Jede vendorte Cargo.toml durchgehen
     total_files = 0
     total_fields = 0
     for cargo_toml in sorted(WGPU_ROOT.rglob("Cargo.toml")):
@@ -887,8 +911,6 @@ def resolve_package_inheritance():
 # 10. wgpu [dependencies]-Vererbung hart auflösen (via tomlkit)
 # ═════════════════════════════════════════════════════════════════════
 def adjust_path_for_vendored(dep_value, vendored_crate_dir, wgpu_root):
-    """Passe path = "..." in dep_value so an, dass er relativ zum vendorten
-    Crate korrekt aufgelöst wird. dep_value ist ein dict."""
     if not isinstance(dep_value, dict):
         return dep_value
     if "path" not in dep_value:
@@ -907,18 +929,13 @@ def adjust_path_for_vendored(dep_value, vendored_crate_dir, wgpu_root):
 
 
 def merge_dep_spec(tomlkit, base, spec, vendored_dir, wgpu_root):
-    """Führt base (aus workspace.dependencies) und spec (aus crate) zusammen.
-    spec enthält 'workspace': true, das entfernt wird."""
-    # spec ohne 'workspace' extrahieren
     spec_extra = {}
     for k in spec.keys():
         if k != "workspace":
             spec_extra[k] = spec[k]
 
-    # base kann ein String (Version) oder ein dict (Tabelle) sein
     if isinstance(base, str):
         if spec_extra:
-            # Tabelle bauen: version + extras
             result = tomlkit.inline_table()
             result["version"] = base
             for k, v in spec_extra.items():
@@ -927,7 +944,6 @@ def merge_dep_spec(tomlkit, base, spec, vendored_dir, wgpu_root):
         else:
             return base
     else:
-        # base ist dict (tomlkit Table oder InlineTable)
         result = tomlkit.inline_table()
         for k, v in base.items():
             result[k] = v
@@ -976,8 +992,6 @@ def resolve_dependency_inheritance():
         vendored_dir = cargo_toml.parent
         modified = False
 
-        # Alle dependency-Sektionen: dependencies, dev-dependencies, build-dependencies
-        # und target.*.dependencies
         sections = []
         for sec_name in ("dependencies", "dev-dependencies", "build-dependencies"):
             if sec_name in doc:
@@ -992,7 +1006,6 @@ def resolve_dependency_inheritance():
         for sec_path, section in sections:
             for dep_name in list(section.keys()):
                 spec = section[dep_name]
-                # Nur inline tables die 'workspace = true' haben
                 if not hasattr(spec, "get"):
                     continue
                 if spec.get("workspace") is not True:
@@ -1137,14 +1150,11 @@ def patch_wgpu_hal_naga():
         log("  bereits gepatcht")
         return
     if old not in text:
-        # Prüfen, ob resolve_dependency_inheritance() bereits gelaufen ist
-        # und die Zeile schon aufgelöst hat.
         if re.search(r'^naga\s*=\s*\{', text, re.MULTILINE):
             log("  bereits aufgelöst (naga = { ... }) – Feature prüfen")
             if "termcolor" in text:
                 log("  termcolor bereits vorhanden")
                 return
-            # Versuche, termcolor nachzurüsten (einfacher Fall)
             def _add_termcolor(m):
                 inner = m.group(1)
                 mf = re.search(r'features\s*=\s*\[([^\]]*)\]', inner)
