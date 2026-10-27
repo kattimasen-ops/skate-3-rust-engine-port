@@ -4,7 +4,7 @@ aarch64-prepare.py — bereitet das Skate-3-Repo für RK3326/M9 Pro vor.
 
 Wendet an:
   1. .cargo/config.toml (Cross-Toolchain, Cortex-A35-Flags)
-  2. Root-Cargo.toml (libc, wgpu-hal als Patch)
+  2. Root-Cargo.toml (libc; ALLE wgpu-* + naga als Pfad-Patches)
   3. skate-game/Cargo.toml (libc, default = [])
   4. main.rs (Module, WGPU-Env, HeadlessFbPlugin)
   5. app.rs (Backends::GL, primary_window: None, winit-disable,
@@ -40,6 +40,17 @@ PORTMASTER  = ROOT / "portmaster"
 CARGO_CFG   = ROOT / ".cargo" / "config.toml"
 WGPU_ROOT   = ROOT / "vendor" / "wgpu"
 WGPU_HAL    = WGPU_ROOT / "wgpu-hal"
+
+# Alle wgpu-Crates + naga, die auf den vendorten Workspace gepatcht werden
+# müssen. Nur wgpu-hal zu patchen führt zu zwei wgpu-types-Versionen im
+# Dependency-Graph (crates.io vs. vendored) → E0308-Typprobleme.
+WGPU_PATCH_ENTRIES = [
+    ("wgpu",        "vendor/wgpu/wgpu"),
+    ("wgpu-core",   "vendor/wgpu/wgpu-core"),
+    ("wgpu-hal",    "vendor/wgpu/wgpu-hal"),
+    ("wgpu-types",  "vendor/wgpu/wgpu-types"),
+    ("naga",        "vendor/wgpu/naga"),
+]
 
 CHECK_ONLY = False
 FORCE = False
@@ -151,6 +162,8 @@ def prepare_cargo_config():
 # ═════════════════════════════════════════════════════════════════════
 def patch_root_cargo(text):
     changed = False
+
+    # libc ergänzen
     if 'libc = "0.2"' not in text and "libc.workspace" not in text:
         if 'serde_json = "1.0"' in text:
             text = text.replace('serde_json = "1.0"',
@@ -164,23 +177,34 @@ def patch_root_cargo(text):
             fail("Root-Cargo.toml: kein Anker für libc")
             return text, False
 
-    if '# wgpu-hal = { path = "vendor/wgpu/wgpu-hal" }' in text:
-        text = text.replace('# wgpu-hal = { path = "vendor/wgpu/wgpu-hal" }',
-                            'wgpu-hal = { path = "vendor/wgpu/wgpu-hal" }', 1)
-        changed = True
-    elif 'wgpu-hal = { path = "vendor/wgpu/wgpu-hal" }' not in text:
-        if "[patch.crates-io]" in text:
-            text = text.replace("[patch.crates-io]",
-                '[patch.crates-io]\nwgpu-hal = { path = "vendor/wgpu/wgpu-hal" }', 1)
+    if "[patch.crates-io]" not in text:
+        warn("Root-Cargo.toml: [patch.crates-io] fehlt")
+        return text, changed
+
+    # Alle wgpu-* + naga Pfad-Patches sicherstellen
+    for crate_name, path in WGPU_PATCH_ENTRIES:
+        active = f'{crate_name} = {{ path = "{path}" }}'
+        commented = f'# {crate_name} = {{ path = "{path}" }}'
+        if active in text:
+            continue
+        if commented in text:
+            text = text.replace(commented, active, 1)
             changed = True
-        else:
-            warn("Root-Cargo.toml: [patch.crates-io] fehlt")
+            continue
+        # Nach dem [patch.crates-io]-Header einfügen
+        text = text.replace(
+            "[patch.crates-io]",
+            f'[patch.crates-io]\n{active}',
+            1,
+        )
+        changed = True
+
     return text, changed
 
 def prepare_root_cargo():
     log("== Root-Cargo.toml ==")
     if not WGPU_ROOT.exists():
-        warn("vendor/wgpu fehlt – wgpu-hal-Patch wird NICHT aktiviert")
+        warn("vendor/wgpu fehlt – wgpu-Patches werden NICHT aktiviert")
     patch_file(ROOT_CARGO, patch_root_cargo, "root Cargo.toml")
 
 
@@ -1123,20 +1147,21 @@ def patch_wgpu_hal_naga():
             # Versuche, termcolor nachzurüsten (einfacher Fall)
             def _add_termcolor(m):
                 inner = m.group(1)
-                if "features" in inner:
-                    if '"termcolor"' in inner or "'termcolor'" in inner:
-                        return m.group(0)
-                    return f"naga = {{ {inner.rstrip()}, features = {_append_feature(inner)} }}"
-                return f'naga = {{ {inner.rstrip()}, features = ["termcolor"] }}'
-            def _append_feature(inner):
                 mf = re.search(r'features\s*=\s*\[([^\]]*)\]', inner)
                 if mf:
                     existing = mf.group(1).strip()
+                    if '"termcolor"' in existing or "'termcolor'" in existing:
+                        return m.group(0)
                     if existing:
-                        return f'[{existing}, "termcolor"]'
-                    return '["termcolor"]'
-                return '["termcolor"]'
-            new_text, n = re.subn(r'^naga\s*=\s*\{([^}]*)\}', _add_termcolor, text, count=1, flags=re.MULTILINE)
+                        new_feats = f'[{existing}, "termcolor"]'
+                    else:
+                        new_feats = '["termcolor"]'
+                    inner_new = re.sub(r'features\s*=\s*\[[^\]]*\]',
+                                       f'features = {new_feats}', inner)
+                    return f"naga = {{{inner_new}}}"
+                return f'naga = {{ {inner.rstrip()}, features = ["termcolor"] }}'
+            new_text, n = re.subn(r'^naga\s*=\s*\{([^}]*)\}', _add_termcolor,
+                                  text, count=1, flags=re.MULTILINE)
             if n > 0 and "termcolor" in new_text:
                 if not CHECK_ONLY:
                     hal_cargo.write_text(new_text)
