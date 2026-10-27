@@ -4,13 +4,15 @@ aarch64-prepare.py — bereitet das Skate-3-Repo für RK3326/M9 Pro vor.
 
 Wendet an:
   1. .cargo/config.toml (Cross-Toolchain, Cortex-A35-Flags)
-  2. Root-Cargo.toml (libc; ALLE wgpu-* + naga als Pfad-Patches)
+  2. Root-Cargo.toml (libc; alle wgpu-* + naga als Pfad-Patches)
   3. skate-game/Cargo.toml (libc, default = [])
-  4. main.rs (Module, WGPU-Env, HeadlessFbPlugin)
-  5. app.rs (Backends::GL, primary_window: None, winit-disable nach .build(),
-             ScheduleRunnerPlugin, GPU-Preproc, ExitCondition)
+  4. main.rs (Module, WGPU-Env, HeadlessFbPlugin, exit-Cast)
+  5. app.rs (Backends::GL, primary_window: None, ExitCondition,
+             winit-disable nach .build(), ScheduleRunnerPlugin,
+             GpuPreprocessingSupport, kein Box)
   6. fb0_writer.rs (nur wenn fehlt)
-  7. headless_plugin.rs (nur wenn fehlt)
+  7. headless_plugin.rs (Bevy-0.18-Fix: Observer statt MessageReader,
+                        korrekte Importe, f32 statt FloatOrd)
   8. portmaster/ (nur wenn fehlt oder --force)
   9. vendor/wgpu: [package]-Vererbung hart auflösen
  10. vendor/wgpu: [dependencies]-Vererbung hart auflösen (via tomlkit)
@@ -41,9 +43,6 @@ CARGO_CFG   = ROOT / ".cargo" / "config.toml"
 WGPU_ROOT   = ROOT / "vendor" / "wgpu"
 WGPU_HAL    = WGPU_ROOT / "wgpu-hal"
 
-# Alle wgpu-Crates + naga, die auf den vendorten Workspace gepatcht werden
-# müssen. Nur wgpu-hal zu patchen führt zu zwei wgpu-types-Versionen im
-# Dependency-Graph (crates.io vs. vendored) → E0308-Typprobleme.
 WGPU_PATCH_ENTRIES = [
     ("wgpu",        "vendor/wgpu/wgpu"),
     ("wgpu-core",   "vendor/wgpu/wgpu-core"),
@@ -66,7 +65,6 @@ def fail(msg):
 
 
 def ensure_tomlkit():
-    """Importiert tomlkit; installiert es bei Bedarf via pip."""
     try:
         import tomlkit
         return tomlkit
@@ -163,7 +161,6 @@ def prepare_cargo_config():
 def patch_root_cargo(text):
     changed = False
 
-    # libc ergänzen
     if 'libc = "0.2"' not in text and "libc.workspace" not in text:
         if 'serde_json = "1.0"' in text:
             text = text.replace('serde_json = "1.0"',
@@ -181,7 +178,6 @@ def patch_root_cargo(text):
         warn("Root-Cargo.toml: [patch.crates-io] fehlt")
         return text, changed
 
-    # Alle wgpu-* + naga Pfad-Patches sicherstellen
     for crate_name, path in WGPU_PATCH_ENTRIES:
         active = f'{crate_name} = {{ path = "{path}" }}'
         commented = f'# {crate_name} = {{ path = "{path}" }}'
@@ -191,7 +187,6 @@ def patch_root_cargo(text):
             text = text.replace(commented, active, 1)
             changed = True
             continue
-        # Nach dem [patch.crates-io]-Header einfügen
         text = text.replace(
             "[patch.crates-io]",
             f'[patch.crates-io]\n{active}',
@@ -267,6 +262,11 @@ def patch_main(text):
         else:
             warn("main.rs: app::build(...)-Anker fehlt")
 
+    # exit-Cast: std::process::exit erwartet i32
+    if "std::process::exit(code)" in text:
+        text = text.replace("std::process::exit(code)", "std::process::exit(code as i32)")
+        changed = True
+
     return text, changed
 
 def prepare_main():
@@ -280,38 +280,44 @@ def prepare_main():
 def patch_app(text):
     changed = False
 
+    # Imports: ExitCondition ergänzen
+    if "ExitCondition" not in text:
+        if "use bevy::winit::WinitSettings" in text:
+            text = text.replace("use bevy::winit::WinitSettings",
+                                "use bevy::winit::WinitSettings;\nuse bevy::window::ExitCondition", 1)
+            changed = True
+        elif "use bevy::{" in text:
+            # Falls kein winit-Import, versuche nach prelude
+            if "use bevy::prelude::*;" in text:
+                text = text.replace("use bevy::prelude::*;",
+                                    "use bevy::prelude::*;\nuse bevy::window::ExitCondition;", 1)
+                changed = True
+        else:
+            warn("app.rs: kein Import-Anker für ExitCondition")
+
     if "Backends::VULKAN" in text:
         text = text.replace("Backends::VULKAN", "Backends::GL", 1)
         changed = True
 
-    # ── Box::new um WgpuSettings ────────────────────────────────────
-    # WICHTIG: ZUERST Klammer matchen, DANN einfügen. Die alte Logik
-    # hat zuerst "Box::new(" eingefügt und dann mit verschobenen
-    # Indizes gematcht → landete bei der falschen schließenden Klammer.
-    if ("Automatic(WgpuSettings" in text
-            and "Automatic(Box::new(WgpuSettings" not in text):
-        idx = text.find("RenderCreation::Automatic(")
+    # Box::new ENTFERNEN, falls vorhanden (Bevy 0.18 will WgpuSettings direkt)
+    if "Automatic(Box::new(WgpuSettings" in text:
+        text = text.replace("Automatic(Box::new(WgpuSettings", "Automatic(WgpuSettings", 1)
+        # zusätzliche schließende Klammer entfernen: ))) -> ))
+        # Suche das passende Muster
+        idx = text.find("Automatic(WgpuSettings")
         if idx >= 0:
-            paren_open = idx + len("RenderCreation::Automatic")
-            if paren_open < len(text) and text[paren_open] == '(':
+            paren_open = text.find("(", idx + len("Automatic"))
+            if paren_open >= 0:
                 close = find_matching(text, paren_open, '(', ')')
                 if close > 0:
-                    text = (
-                        text[:paren_open + 1]
-                        + "Box::new("
-                        + text[paren_open + 1:close]
-                        + ")"
-                        + text[close:]
-                    )
-                    changed = True
-                else:
-                    warn("app.rs: Automatic(...) Klammer nicht geschlossen")
-            else:
-                warn("app.rs: '(' nach 'RenderCreation::Automatic' fehlt")
-        else:
-            warn("app.rs: 'RenderCreation::Automatic(' nicht gefunden")
+                    # nach close sollte noch eine schließende Klammer für Box sein
+                    # Box::new hatte ein zusätzliches )
+                    after = text[close+1:close+2]
+                    if after == ')':
+                        text = text[:close+1] + text[close+2:]
+        changed = True
 
-    # ── primary_window: Some(Window{...}) → None ────────────────────
+    # primary_window: Some(Window{...}) → None
     if "primary_window: Some" in text and "primary_window: None" not in text:
         idx = text.find("primary_window: Some")
         j = idx + len("primary_window: Some")
@@ -323,7 +329,7 @@ def patch_app(text):
                 text = text[:idx] + "primary_window: None" + text[close + 1:]
                 changed = True
 
-    # ── exit_condition: ExitCondition::DontExit ─────────────────────
+    # ExitCondition einfügen
     if "ExitCondition::DontExit" not in text:
         anchor = "primary_window: None"
         idx = text.find(anchor)
@@ -344,7 +350,7 @@ def patch_app(text):
         else:
             warn("app.rs: 'primary_window: None' fehlt – exit_condition nicht eingefügt")
 
-    # ── Winit-disable: NACH .build(), nicht davor ──────────────────
+    # Winit-disable NACH .build()
     if ("disable::<WinitPlugin>" not in text
             and "disable::<bevy::winit::WinitPlugin>" not in text):
         if ".build()" in text:
@@ -357,7 +363,7 @@ def patch_app(text):
         else:
             warn("app.rs: '.build()' fehlt – winit-disable nicht eingefügt")
 
-    # ── ScheduleRunnerPlugin ────────────────────────────────────────
+    # ScheduleRunnerPlugin
     if "ScheduleRunnerPlugin" not in text:
         m = re.search(r'app\.add_plugins\s*\(\s*\n?\s*DefaultPlugins', text)
         if m:
@@ -379,27 +385,22 @@ def patch_app(text):
         else:
             warn("app.rs: 'app.add_plugins(DefaultPlugins' nicht gefunden")
 
-    # ── GpuPreprocessingSupport ─────────────────────────────────────
+    # GpuPreprocessingSupport: VOR dem finalen `app` einfügen, mit ;
     if "GpuPreprocessingSupport" not in text:
-        idx = text.find("fn build")
+        # Suche das letzte `app` vor der schließenden Klammer von fn build
+        idx = text.rfind("\n    app\n")
         if idx >= 0:
-            brace_open = text.find("{", idx)
-            if brace_open > 0:
-                close = find_matching(text, brace_open, '{', '}')
-                if close > 0:
-                    insert = (
-                        "\n    if let Some(render_app) = app.get_sub_app_mut(bevy::render::RenderApp) {\n"
-                        "        render_app.insert_resource(bevy::render::batching::gpu_preprocessing::GpuPreprocessingSupport {\n"
-                        "            max_supported_mode: bevy::render::batching::gpu_preprocessing::GpuPreprocessingMode::None,\n"
-                        "        });\n"
-                        "    }\n"
-                    )
-                    text = text[:close] + insert + text[close:]
-                    changed = True
-                else:
-                    warn("app.rs: build()-Klammer nicht gefunden")
-            else:
-                warn("app.rs: build()-Öffnungsklammer nicht gefunden")
+            insert = (
+                "\n    if let Some(render_app) = app.get_sub_app_mut(bevy::render::RenderApp) {\n"
+                "        render_app.insert_resource(bevy::render::batching::gpu_preprocessing::GpuPreprocessingSupport {\n"
+                "            max_supported_mode: bevy::render::batching::gpu_preprocessing::GpuPreprocessingMode::None,\n"
+                "        });\n"
+                "    }\n"
+            )
+            text = text[:idx] + insert + "\n    app" + text[idx + len("\n    app"):]
+            changed = True
+        else:
+            warn("app.rs: '\\n    app\\n' als Anker für GpuPreprocessingSupport fehlt")
 
     return text, changed
 
@@ -536,17 +537,17 @@ def prepare_fb0():
 
 
 # ═════════════════════════════════════════════════════════════════════
-# 7. headless_plugin.rs (nur wenn fehlt)
+# 7. headless_plugin.rs (Bevy-0.18-Fix)
 # ═════════════════════════════════════════════════════════════════════
 HEADLESS_RS_FALLBACK = r'''//! Headless-Rendering -> /dev/fb0 via Screenshot-API (Bevy 0.18).
+//! R36S-Bevy0.18-Fix: Observer statt MessageReader, korrekte Importe.
 use bevy::prelude::*;
 use bevy::camera::{ImageRenderTarget, RenderTarget};
-use bevy::math::FloatOrd;
-use bevy::render::batching::gpu_preprocessing::NoIndirectDrawing;
+use bevy::camera::visibility::RenderLayers;
+use bevy::render::view::NoIndirectDrawing;
 use bevy::render::render_resource::{
     Extent3d, TextureDescriptor, TextureDimension, TextureFormat, TextureUsages,
 };
-use bevy::render::view::RenderLayers;
 use bevy::render::view::window::screenshot::{
     Screenshot, ScreenshotCaptured, ScreenshotPlugin,
 };
@@ -560,7 +561,7 @@ impl Plugin for HeadlessFbPlugin {
     fn build(&self, app: &mut App) {
         app.add_plugins(ScreenshotPlugin)
             .add_systems(Startup, (clear_fb0, setup_offscreen).chain())
-            .add_systems(Update, (request_screenshot, copy_to_fb0).chain());
+            .add_systems(Update, request_screenshot);
     }
 }
 
@@ -598,7 +599,7 @@ fn setup_offscreen(
         Camera3d::default(),
         RenderTarget::Image(ImageRenderTarget {
             handle: handle.clone(),
-            scale_factor: FloatOrd(1.0),
+            scale_factor: 1.0,
         }),
         NoIndirectDrawing,
         RenderLayers::default(),
@@ -622,20 +623,29 @@ fn request_screenshot(
     }
 }
 
-fn copy_to_fb0(
-    mut messages: MessageReader<ScreenshotCaptured>,
-    mut state: ResMut<FbState>,
-) {
-    for msg in messages.read() {
-        let Some(writer) = state.writer.as_mut() else { continue; };
-        let _ = writer.write_rgba8(&msg.image.data, msg.image.width(), msg.image.height());
-    }
+fn copy_to_fb0(trigger: Trigger<ScreenshotCaptured>, mut state: ResMut<FbState>) {
+    let msg = trigger.event();
+    let Some(writer) = state.writer.as_mut() else { return; };
+    let _ = writer.write_rgba8(&msg.image.data, msg.image.width(), msg.image.height());
 }
 '''
 
 def prepare_headless():
     log("== headless_plugin.rs ==")
+    # Prüfe, ob die Datei den alten, fehlerhaften Marker enthält
     if HEADLESS_RS.exists():
+        old = HEADLESS_RS.read_text()
+        if "R36S-Bevy0.18-Fix" in old:
+            log("  bereits auf Bevy-0.18-API gepatcht")
+            return
+        if "MessageReader<ScreenshotCaptured>" in old:
+            log("  alte MessageReader-Version erkannt – ersetze durch Observer-Version")
+            if not CHECK_ONLY:
+                HEADLESS_RS.write_text(HEADLESS_RS_FALLBACK)
+                log(f"  gepatcht: {HEADLESS_RS.relative_to(ROOT)} (R36S-Bevy0.18-Fix)")
+            else:
+                log("  würde patchen (CHECK_ONLY)")
+            return
         log("  existiert bereits (deine Version wird verwendet)")
         return
     write_if_missing(HEADLESS_RS, HEADLESS_RS_FALLBACK)
@@ -1254,8 +1264,6 @@ def main():
     prepare_fb0()
     prepare_headless()
     prepare_portmaster()
-    # naga termcolor MUSS vor resolve_dependency_inheritance() laufen,
-    # solange in wgpu-hal/Cargo.toml noch "naga.workspace = true" steht.
     patch_wgpu_hal_naga()
     resolve_package_inheritance()
     resolve_dependency_inheritance()
