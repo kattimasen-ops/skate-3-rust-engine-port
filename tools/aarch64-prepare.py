@@ -3,16 +3,15 @@
 aarch64-prepare.py — bereitet das Skate-3-Repo für RK3326/M9 Pro vor.
 
 Wendet an:
-  1. .cargo/config.toml (Cross-Toolchain, Cortex-A35-Flags)
+  1. .cargo/config.toml (Cross-Toolchain, Cortex-A35-Flags, Linker-Optimierung)
   2. Root-Cargo.toml (libc; alle wgpu-* + naga als Pfad-Patches)
   3. skate-game/Cargo.toml (libc, default = [])
-  4. main.rs (Module, WGPU-Env, HeadlessFbPlugin, exit-Cast)
-  5. app.rs (Backends::GL, primary_window: None, ExitCondition,
+  4. main.rs (Module, WGPU-Env in unsafe-Block, HeadlessFbPlugin, exit-Cast)
+  5. app.rs (Backends::GL, primary_window: None, ExitCondition-Import,
              winit-disable nach .build(), ScheduleRunnerPlugin,
              GpuPreprocessingSupport, kein Box)
   6. fb0_writer.rs (nur wenn fehlt)
-  7. headless_plugin.rs (Bevy-0.18-Fix: Observer statt MessageReader,
-                        korrekte Importe, f32 statt FloatOrd)
+  7. headless_plugin.rs (Bevy-0.18-Fix: On statt Trigger, Observer)
   8. portmaster/ (nur wenn fehlt oder --force)
   9. vendor/wgpu: [package]-Vererbung hart auflösen
  10. vendor/wgpu: [dependencies]-Vererbung hart auflösen (via tomlkit)
@@ -136,12 +135,21 @@ CARGO_CONFIG = """\
 [target.aarch64-unknown-linux-gnu]
 linker = "aarch64-linux-gnu-gcc"
 rustflags = [
+    # Performance & Cortex-A35
     "-C", "target-cpu=cortex-a35",
     "-C", "target-feature=-outline-atomics",
+    # LTO wird über Cargo.toml (profile.release) gesteuert
+    # Linker-Optimierung: tote Sektionen entfernen, nur benötigte Bibliotheken linken
     "-C", "link-arg=-Wl,--gc-sections",
     "-C", "link-arg=-Wl,--as-needed",
     "-C", "link-arg=-Wl,-O2",
+    "-C", "link-arg=-Wl,--sort-common",
+    # libgcc statisch einbinden (glibc bleibt dynamisch für 2.30-Kompatibilität)
     "-C", "link-arg=-static-libgcc",
+    # Absicherung gegen Cross-Link-Probleme mit dynamischen Abhängigkeiten
+    # (wgpu lädt Mali/EGL/GLESv2 zur Laufzeit per dlopen; keine -lmali nötig)
+    "-C", "link-arg=-Wl,--allow-shlib-undefined",
+    # panic=abort reduziert Unwind-Tabellen
     "-C", "panic=abort",
 ]
 
@@ -242,15 +250,31 @@ def patch_main(text):
         else:
             warn("main.rs: 'mod trigger_volumes;' fehlt")
 
+    # set_var in unsafe-Block (Edition 2024 / Rust 1.92+)
     if 'std::env::set_var("WGPU_BACKEND"' not in text:
         if "fn main() -> bevy::app::AppExit {" in text:
             text = text.replace("fn main() -> bevy::app::AppExit {",
                 'fn main() -> bevy::app::AppExit {\n'
-                '    std::env::set_var("WGPU_BACKEND", "gl");\n'
-                '    std::env::set_var("WGPU_SETTINGS_PRIO", "webgl2");', 1)
+                '    unsafe {\n'
+                '        std::env::set_var("WGPU_BACKEND", "gl");\n'
+                '        std::env::set_var("WGPU_SETTINGS_PRIO", "webgl2");\n'
+                '    }', 1)
             changed = True
         else:
             warn("main.rs: 'fn main() -> bevy::app::AppExit {' fehlt")
+    elif ('std::env::set_var("WGPU_BACKEND"' in text
+          and 'unsafe {\n        std::env::set_var' not in text):
+        # Reparatur: bereits vorhandene set_var ohne unsafe
+        text = text.replace(
+            '    std::env::set_var("WGPU_BACKEND", "gl");\n'
+            '    std::env::set_var("WGPU_SETTINGS_PRIO", "webgl2");',
+            '    unsafe {\n'
+            '        std::env::set_var("WGPU_BACKEND", "gl");\n'
+            '        std::env::set_var("WGPU_SETTINGS_PRIO", "webgl2");\n'
+            '    }',
+            1,
+        )
+        changed = True
 
     if "headless_plugin::HeadlessFbPlugin" not in text:
         if "let mut app = app::build(config, manifest, graphs, physics, skater);" in text:
@@ -280,18 +304,16 @@ def prepare_main():
 def patch_app(text):
     changed = False
 
-    # Imports: ExitCondition ergänzen
-    if "ExitCondition" not in text:
-        if "use bevy::winit::WinitSettings" in text:
-            text = text.replace("use bevy::winit::WinitSettings",
-                                "use bevy::winit::WinitSettings;\nuse bevy::window::ExitCondition", 1)
+    # Imports: ExitCondition ergänzen (liegt in bevy::window)
+    if "use bevy::window::ExitCondition;" not in text:
+        if "use bevy::prelude::*;" in text:
+            text = text.replace("use bevy::prelude::*;",
+                                "use bevy::prelude::*;\nuse bevy::window::ExitCondition;", 1)
             changed = True
         elif "use bevy::{" in text:
-            # Falls kein winit-Import, versuche nach prelude
-            if "use bevy::prelude::*;" in text:
-                text = text.replace("use bevy::prelude::*;",
-                                    "use bevy::prelude::*;\nuse bevy::window::ExitCondition;", 1)
-                changed = True
+            text = text.replace("use bevy::{",
+                                "use bevy::window::ExitCondition;\nuse bevy::{", 1)
+            changed = True
         else:
             warn("app.rs: kein Import-Anker für ExitCondition")
 
@@ -302,19 +324,13 @@ def patch_app(text):
     # Box::new ENTFERNEN, falls vorhanden (Bevy 0.18 will WgpuSettings direkt)
     if "Automatic(Box::new(WgpuSettings" in text:
         text = text.replace("Automatic(Box::new(WgpuSettings", "Automatic(WgpuSettings", 1)
-        # zusätzliche schließende Klammer entfernen: ))) -> ))
-        # Suche das passende Muster
         idx = text.find("Automatic(WgpuSettings")
         if idx >= 0:
             paren_open = text.find("(", idx + len("Automatic"))
             if paren_open >= 0:
                 close = find_matching(text, paren_open, '(', ')')
-                if close > 0:
-                    # nach close sollte noch eine schließende Klammer für Box sein
-                    # Box::new hatte ein zusätzliches )
-                    after = text[close+1:close+2]
-                    if after == ')':
-                        text = text[:close+1] + text[close+2:]
+                if close > 0 and text[close+1:close+2] == ')':
+                    text = text[:close+1] + text[close+2:]
         changed = True
 
     # primary_window: Some(Window{...}) → None
@@ -387,7 +403,6 @@ def patch_app(text):
 
     # GpuPreprocessingSupport: VOR dem finalen `app` einfügen, mit ;
     if "GpuPreprocessingSupport" not in text:
-        # Suche das letzte `app` vor der schließenden Klammer von fn build
         idx = text.rfind("\n    app\n")
         if idx >= 0:
             insert = (
@@ -540,7 +555,7 @@ def prepare_fb0():
 # 7. headless_plugin.rs (Bevy-0.18-Fix)
 # ═════════════════════════════════════════════════════════════════════
 HEADLESS_RS_FALLBACK = r'''//! Headless-Rendering -> /dev/fb0 via Screenshot-API (Bevy 0.18).
-//! R36S-Bevy0.18-Fix: Observer statt MessageReader, korrekte Importe.
+//! R36S-Bevy0.18-Fix: On statt Trigger, Observer statt MessageReader.
 use bevy::prelude::*;
 use bevy::camera::{ImageRenderTarget, RenderTarget};
 use bevy::camera::visibility::RenderLayers;
@@ -561,7 +576,8 @@ impl Plugin for HeadlessFbPlugin {
     fn build(&self, app: &mut App) {
         app.add_plugins(ScreenshotPlugin)
             .add_systems(Startup, (clear_fb0, setup_offscreen).chain())
-            .add_systems(Update, request_screenshot);
+            .add_systems(Update, request_screenshot)
+            .add_observer(copy_to_fb0);
     }
 }
 
@@ -623,7 +639,7 @@ fn request_screenshot(
     }
 }
 
-fn copy_to_fb0(trigger: Trigger<ScreenshotCaptured>, mut state: ResMut<FbState>) {
+fn copy_to_fb0(trigger: On<ScreenshotCaptured>, mut state: ResMut<FbState>) {
     let msg = trigger.event();
     let Some(writer) = state.writer.as_mut() else { return; };
     let _ = writer.write_rgba8(&msg.image.data, msg.image.width(), msg.image.height());
@@ -632,14 +648,14 @@ fn copy_to_fb0(trigger: Trigger<ScreenshotCaptured>, mut state: ResMut<FbState>)
 
 def prepare_headless():
     log("== headless_plugin.rs ==")
-    # Prüfe, ob die Datei den alten, fehlerhaften Marker enthält
     if HEADLESS_RS.exists():
         old = HEADLESS_RS.read_text()
         if "R36S-Bevy0.18-Fix" in old:
             log("  bereits auf Bevy-0.18-API gepatcht")
             return
-        if "MessageReader<ScreenshotCaptured>" in old:
-            log("  alte MessageReader-Version erkannt – ersetze durch Observer-Version")
+        if ("MessageReader<ScreenshotCaptured>" in old
+                or "Trigger<ScreenshotCaptured>" in old):
+            log("  alte Screenshot-Version erkannt – ersetze durch Observer-Version")
             if not CHECK_ONLY:
                 HEADLESS_RS.write_text(HEADLESS_RS_FALLBACK)
                 log(f"  gepatcht: {HEADLESS_RS.relative_to(ROOT)} (R36S-Bevy0.18-Fix)")
@@ -663,9 +679,9 @@ PORT_JSON = '''\
   "attr": {
     "title": "Skate 3",
     "porter": ["kattimasen-ops"],
-    "desc": "Skate 3 native ARM64 port for RK3326 (M9 Pro / ArkOS). Requires your own Xbox 360 ISO to generate the .pak assets.",
+    "desc": "Skate 3 native ARM64 port for RK3326 (M9 Pro / ArkOS).",
     "desc_md": null,
-    "inst": "Copy your converted .pak files into the skate3/assets/ folder.",
+    "inst": "Copy your .pak files into the skate3/assets/ folder.",
     "inst_md": null,
     "genres": ["sports"],
     "image": null,
@@ -686,13 +702,9 @@ README_MD = '''\
 
 Native ARM64 port of **Skate 3** for the **M9 Pro / RK3326 / ArkOS4Clone**.
 
-### You need your own game data
-This port contains no game assets. Convert your own Xbox 360 ISO to `.pak` files.
-
-1. Extract with `extract-xiso`.
-2. Run `prepare_assets.py` from the engine repo.
-3. Run `vita-bake` to produce `.pak` files.
-4. Copy `.pak` files into `skate3/assets/`.
+### Game data
+Place your `.pak` files in `skate3/assets/`. The port starts as soon as
+`skate3/assets/*.pak` is present.
 
 ### Performance (RK3326)
 - 448x336, shadows off, NPC draw dist 10u, traffic/ped 25%, V-Sync off
