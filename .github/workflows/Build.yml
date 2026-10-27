@@ -1,0 +1,255 @@
+name: Build Skate3 PortMaster (RK3326 / M9 Pro)
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main, master]
+    paths-ignore:
+      - 'docs/**'
+      - '*.md'
+      - 'README.md'
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build aarch64 PortMaster package
+    runs-on: ubuntu-22.04
+    container: ubuntu:20.04
+    timeout-minutes: 240
+    defaults:
+      run:
+        shell: bash
+
+    env:
+      DEBIAN_FRONTEND: noninteractive
+      RUSTUP_TOOLCHAIN: stable
+      CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc
+      WGPU_BACKEND: "gl"
+      WGPU_SETTINGS_PRIO: "webgl2"
+      RUST_BACKTRACE: "1"
+      CARGO_TERM_COLOR: always
+      JOBS: "4"
+      PORT_NAME: "skate3"
+      MAX_GLIBC: "2.30"
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          submodules: false
+
+      - name: Repo-Struktur pruefen
+        run: |
+          set -euo pipefail
+          echo "== Root =="; ls -la
+          echo ""
+          echo "== Cargo.toml (Workspace) =="
+          cat Cargo.toml
+          echo ""
+          echo "== Pflichtdateien pruefen =="
+          MISSING=0
+          for f in .cargo/config.toml \
+                   crates/skate-game/src/fb0_writer.rs \
+                   crates/skate-game/src/headless_plugin.rs \
+                   crates/skate-game/src/image_copy.rs \
+                   portmaster/Skate3.sh portmaster/port.json \
+                   portmaster/README.md portmaster/gameinfo.xml; do
+            if [ -f "$f" ]; then echo "  OK: $f"; else echo "  FEHLT: $f"; MISSING=1; fi
+          done
+          if [ "$MISSING" -eq 1 ]; then
+            echo "::error::Pflichtdateien fehlen"
+            exit 1
+          fi
+
+      - name: Vita-Toolchain-Dateien neutralisieren
+        run: |
+          set -euo pipefail
+          for f in rust-toolchain rust-toolchain.toml; do
+            if [ -f "$f" ]; then
+              mv "$f" "$f.disabled-for-aarch64"
+              echo "Deaktiviert: $f"
+            fi
+          done
+
+      - name: aarch64 Multiarch aktivieren
+        run: |
+          set -euo pipefail
+          dpkg --add-architecture arm64
+          cp /etc/apt/sources.list /etc/apt/sources.list.bak
+          sed -i -E 's/^deb (\[[^]]*\] )?http/deb [arch=amd64] http/' /etc/apt/sources.list
+          printf '%s\n' \
+            'deb [arch=arm64] http://ports.ubuntu.com/ubuntu-ports focal main universe' \
+            'deb [arch=arm64] http://ports.ubuntu.com/ubuntu-ports focal-updates main universe' \
+            'deb [arch=arm64] http://ports.ubuntu.com/ubuntu-ports focal-security main universe' \
+            > /etc/apt/sources.list.d/arm64.list
+          apt-get update
+
+      - name: Build-Pakete installieren (inkl. git und python3)
+        run: |
+          set -euo pipefail
+          apt-get install -y --no-install-recommends \
+            git python3 build-essential gcc-aarch64-linux-gnu g++-aarch64-linux-gnu \
+            binutils-aarch64-linux-gnu pkg-config curl ca-certificates \
+            file patchelf zip unzip imagemagick \
+            libasound2-dev:arm64 libudev-dev:arm64 \
+            libdrm-dev:arm64 libgbm-dev:arm64 \
+            libegl-dev:arm64 libgles2-mesa-dev:arm64
+          echo "== Tool-Versionen =="
+          git --version
+          python3 --version
+
+      - name: wgpu v27.0.1 klonen und Mali-G31-Patch anwenden
+        run: |
+          set -euo pipefail
+          git clone --depth 1 --branch v27.0.1 \
+            https://github.com/gfx-rs/wgpu.git vendor/wgpu
+
+          ADAPTER="vendor/wgpu/wgpu-hal/src/gles/adapter.rs"
+          if [ ! -f "$ADAPTER" ]; then
+            echo "::error::$ADAPTER nicht gefunden"
+            exit 1
+          fi
+
+          python3 - <<'PY'
+          import sys
+          path = "vendor/wgpu/wgpu-hal/src/gles/adapter.rs"
+          text = open(path).read()
+
+          old = """let max_storage_buffers_per_shader_stage = if vertex_shader_storage_blocks == 0 {
+              fragment_shader_storage_blocks
+          } else {
+              vertex_shader_storage_blocks.min(fragment_shader_storage_blocks)
+          };"""
+
+          new = """let max_storage_buffers_per_shader_stage = if vertex_shader_storage_blocks == 0 {
+              if vertex_ssbo_false_zero {
+                  fragment_shader_storage_blocks
+              } else {
+                  0 // Mali-G31 R36S-Fix
+              }
+          } else {
+              vertex_shader_storage_blocks.min(fragment_shader_storage_blocks)
+          };"""
+
+          if old not in text:
+              print("FEHLER: Anker in adapter.rs nicht gefunden", file=sys.stderr)
+              sys.exit(1)
+          if new in text:
+              print("OK: Patch bereits vorhanden")
+              sys.exit(0)
+
+          open(path, "w").write(text.replace(old, new, 1))
+          print("OK: wgpu-hal adapter.rs gepatcht.")
+          PY
+
+          grep -n "Mali-G31 R36S-Fix" "$ADAPTER" || exit 1
+
+          if ! grep -q '^wgpu-hal = { path = "vendor/wgpu/wgpu-hal" }' Cargo.toml; then
+            sed -i 's|^# wgpu-hal = { path = "vendor/wgpu/wgpu-hal" }|wgpu-hal = { path = "vendor/wgpu/wgpu-hal" }|' Cargo.toml
+          fi
+          grep -n "wgpu-hal" Cargo.toml || exit 1
+
+      - name: Rust installieren
+        run: |
+          set -euo pipefail
+          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
+            | sh -s -- -y --default-toolchain stable
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+          export PATH="$HOME/.cargo/bin:$PATH"
+          rustc --version
+          cargo --version
+
+      - name: aarch64-Target hinzufuegen
+        run: |
+          set -euo pipefail
+          export PATH="$HOME/.cargo/bin:$PATH"
+          rustup target add aarch64-unknown-linux-gnu
+
+      - name: Cargo Build (aarch64, workspace)
+        run: |
+          set -euo pipefail
+          export PATH="$HOME/.cargo/bin:$PATH"
+          cargo build \
+            --release \
+            --target aarch64-unknown-linux-gnu \
+            --workspace \
+            --jobs "$JOBS" \
+            2>&1 | tee build.log
+
+      - name: glibc 2.30 pruefen
+        run: |
+          set -euo pipefail
+          BIN=target/aarch64-unknown-linux-gnu/release/skate3rust
+          if [ ! -x "$BIN" ]; then
+            echo "::error::$BIN nicht gefunden"
+            exit 1
+          fi
+          file "$BIN"
+          MAX=$(aarch64-linux-gnu-objdump -T "$BIN" \
+            | { grep -oE 'GLIBC_[0-9][0-9.]*' || true; } \
+            | sed 's/^GLIBC_//' | sort -Vu | tail -1)
+          echo "Hoechste GLIBC-Version: ${MAX:-keine}"
+          if [ -n "$MAX" ] && [ "$(printf '%s\n%s\n' "$MAX_GLIBC" "$MAX" | sort -V | tail -1)" != "$MAX_GLIBC" ]; then
+            echo "::error::Braucht GLIBC_$MAX, ArkOS hat nur $MAX_GLIBC"
+            exit 1
+          fi
+
+      - name: PortMaster-Paket vorbereiten
+        if: always()
+        run: |
+          set -euo pipefail
+          STAGE="$GITHUB_WORKSPACE/dist"
+          PORT_DIR="$STAGE/$PORT_NAME"
+          rm -rf "$STAGE"
+          mkdir -p "$PORT_DIR/$PORT_NAME/assets"
+
+          BIN="target/aarch64-unknown-linux-gnu/release/skate3rust"
+          if [ ! -x "$BIN" ]; then
+            echo "::error::skate3rust-Binary fehlt"
+            exit 1
+          fi
+          install -m 755 "$BIN" "$PORT_DIR/$PORT_NAME/skate3"
+          strip --strip-unneeded "$PORT_DIR/$PORT_NAME/skate3" 2>/dev/null || true
+          touch "$PORT_DIR/$PORT_NAME/assets/.gitkeep"
+
+          cp "$GITHUB_WORKSPACE/portmaster/Skate3.sh"    "$PORT_DIR/Skate3.sh"
+          cp "$GITHUB_WORKSPACE/portmaster/port.json"    "$PORT_DIR/port.json"
+          cp "$GITHUB_WORKSPACE/portmaster/README.md"    "$PORT_DIR/README.md"
+          cp "$GITHUB_WORKSPACE/portmaster/gameinfo.xml" "$PORT_DIR/gameinfo.xml"
+          chmod 755 "$PORT_DIR/Skate3.sh"
+
+          echo "PORT_DIR=$PORT_DIR" >> "$GITHUB_ENV"
+
+      - name: Screenshot erzeugen
+        run: |
+          set -euo pipefail
+          PORT_DIR="${PORT_DIR:?PORT_DIR nicht gesetzt}"
+          convert -size 640x480 xc:black -gravity center \
+                  -fill white -pointsize 48 -annotate 0 "Skate 3" \
+                  "$PORT_DIR/screenshot.jpg"
+
+      - name: PortMaster-ZIP erstellen
+        run: |
+          set -euo pipefail
+          cd "$GITHUB_WORKSPACE/dist"
+          zip -r "skate3.zip" "$PORT_NAME" -x "*.git*"
+          unzip -l "skate3.zip"
+
+      - name: Artefakt hochladen
+        uses: actions/upload-artifact@v4
+        with:
+          name: skate3-portmaster
+          path: dist/skate3.zip
+          retention-days: 30
+          if-no-files-found: error
+
+      - name: Build-Log hochladen
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: skate3-build-log
+          path: build.log
+          retention-days: 14
+          if-no-files-found: warn
