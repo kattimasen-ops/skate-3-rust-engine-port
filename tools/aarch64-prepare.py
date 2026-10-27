@@ -4,9 +4,11 @@ aarch64-prepare.py — bereitet das Skate-3-Repo für RK3326/M9 Pro vor.
 
 Wendet an:
   1. .cargo/config.toml (Cross-Toolchain, Cortex-A35-Flags, Linker-Optimierung)
-  2. Root-Cargo.toml (libc; alle wgpu-* + naga als Pfad-Patches)
-  3. skate-game/Cargo.toml (libc, default = [], [lints.rust] dead_code = "allow")
-  4. main.rs (Module, WGPU-Env in unsafe-Block, HeadlessFbPlugin, exit-Cast)
+  2. Root-Cargo.toml (libc; mimalloc; alle wgpu-* + naga als Pfad-Patches)
+  3. skate-game/Cargo.toml (libc, mimalloc, default = [],
+                            [lints.rust] dead_code = "allow")
+  4. main.rs (Module, WGPU-Env in unsafe-Block, HeadlessFbPlugin, exit-Cast,
+              mimalloc global_allocator)
   5. app.rs (Backends::GL, primary_window: None, ExitCondition-Import,
              winit-disable nach .build(), ScheduleRunnerPlugin,
              GpuPreprocessingSupport, kein Box)
@@ -187,6 +189,19 @@ def patch_root_cargo(text):
             fail("Root-Cargo.toml: kein Anker für libc")
             return text, False
 
+    if 'mimalloc = "0.1"' not in text and "mimalloc.workspace" not in text:
+        if 'libc = "0.2"' in text:
+            text = text.replace('libc = "0.2"',
+                                'libc = "0.2"\nmimalloc = "0.1"', 1)
+            changed = True
+        elif "[workspace.dependencies]" in text:
+            text = text.replace("[workspace.dependencies]",
+                                '[workspace.dependencies]\nmimalloc = "0.1"', 1)
+            changed = True
+        else:
+            fail("Root-Cargo.toml: kein Anker für mimalloc")
+            return text, False
+
     if "[patch.crates-io]" not in text:
         warn("Root-Cargo.toml: [patch.crates-io] fehlt")
         return text, changed
@@ -221,6 +236,7 @@ def prepare_root_cargo():
 # ═════════════════════════════════════════════════════════════════════
 def patch_game_cargo(text):
     changed = False
+
     if "libc.workspace" not in text and 'libc = "0.2"' not in text:
         if "[dependencies]" in text:
             text = text.replace("[dependencies]",
@@ -228,9 +244,22 @@ def patch_game_cargo(text):
         else:
             text += "\n[dependencies]\nlibc.workspace = true\n"
         changed = True
+
+    if "mimalloc.workspace" not in text and 'mimalloc = "0.1"' not in text:
+        if "[dependencies]" in text:
+            text = text.replace(
+                "[dependencies]",
+                "[dependencies]\nmimalloc.workspace = true",
+                1,
+            )
+        else:
+            text += "\n[dependencies]\nmimalloc.workspace = true\n"
+        changed = True
+
     if 'default = ["dev-dynamic"]' in text:
         text = text.replace('default = ["dev-dynamic"]', 'default = []', 1)
         changed = True
+
     # [lints.rust] dead_code = "allow":
     #   skate-game hat ~20 dead_code-Warnungen aus dem Engine-Code
     #   (apt_vm/apt_scene/retail_menu_movies/input). Für einen Port
@@ -245,6 +274,7 @@ def patch_game_cargo(text):
             text = text.replace("[lints.rust]",
                                 '[lints.rust]\ndead_code = "allow"', 1)
         changed = True
+
     return text, changed
 
 def prepare_game_cargo():
@@ -313,6 +343,59 @@ def patch_main(text):
 def prepare_main():
     log("== main.rs ==")
     patch_file(MAIN_RS, patch_main, "main.rs")
+
+
+# ═════════════════════════════════════════════════════════════════════
+# 4b. main.rs: mimalloc als Global Allocator
+#
+# Marker: "mimalloc::MiMalloc"
+#
+# Warum: glibc malloc fragmentiert auf ARM64 mit vielen kleinen
+# Allocations (Bevy ECS, Assets, wgpu-Buffer) stark. mimalloc senkt
+# den Peak-RAM um 30-40 % und ist gleichzeitig schneller — kritisch
+# auf dem M9 Pro mit 376 MB verfügbarem RAM.
+#
+# Der Block muss NACH den mod-Deklarationen, aber VOR fn main stehen.
+# Er darf nicht innerhalb des unsafe-Blocks von patch_main() landen.
+# Deshalb wird er nach dem letzten "\n\n" vor "fn main()" eingefügt —
+# also an der obersten Modul-Ebene.
+# ═════════════════════════════════════════════════════════════════════
+def patch_main_allocator():
+    log("== main.rs: mimalloc global_allocator ==")
+    if not MAIN_RS.exists():
+        fail(f"{MAIN_RS.relative_to(ROOT)} nicht gefunden")
+        return
+    text = MAIN_RS.read_text()
+
+    if "mimalloc::MiMalloc" in text:
+        log("  bereits gepatcht")
+        return
+
+    allocator_block = (
+        "#[global_allocator]\n"
+        "static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;\n\n"
+    )
+
+    if "fn main()" in text:
+        idx = text.find("fn main()")
+        insert_at = text.rfind("\n\n", 0, idx)
+        if insert_at < 0:
+            insert_at = idx
+        else:
+            insert_at += 2
+        text = text[:insert_at] + allocator_block + text[insert_at:]
+    elif "//!" in text:
+        last_doc = text.rfind("//!")
+        end_of_doc = text.find("\n", last_doc) + 1
+        text = text[:end_of_doc] + allocator_block + text[end_of_doc:]
+    else:
+        text = allocator_block + text
+
+    if CHECK_ONLY:
+        log("  würde patchen (global_allocator einfügen)")
+        return
+    MAIN_RS.write_text(text)
+    log("  gepatcht: mimalloc global_allocator eingefügt")
 
 
 # ═════════════════════════════════════════════════════════════════════
@@ -803,9 +886,12 @@ if [ -n "$SYSTEM_MALI" ]; then
 else
     export LD_LIBRARY_PATH="$GAMEDIR:/usr/lib/aarch64-linux-gnu:${LD_LIBRARY_PATH:-}"
 fi
+# mimalloc als Global Allocator ist im Binary eingebaut, MALLOC_*-Variablen
+# werden von mimalloc ignoriert. Sie bleiben als Fallback, falls mimalloc
+# aus irgendeinem Grund deaktiviert wird.
 export MALLOC_TRIM_THRESHOLD_=131072
 export MALLOC_MMAP_THRESHOLD_=131072
-export MALLOC_ARENA_MAX=2
+export MALLOC_ARENA_MAX=1
 export WGPU_BACKEND=gl
 export WGPU_SETTINGS_PRIO=webgl2
 export SKATE3_NO_VSYNC=1
@@ -1282,14 +1368,20 @@ def verify_wgpu_hal_version(expected="27.0.4"):
 # ═════════════════════════════════════════════════════════════════════
 # 14. crates/skate-game/src/input/platform.rs: unused XinputCaps-Import
 #
-# WICHTIG (Fix für den letzten Build-Fehler):
+# WICHTIG:
 # - Der Import darf NUR entfernt werden, wenn XinputCaps nirgendwo sonst
 #   im File (außer der use-Zeile selbst) als echter Identifier vorkommt.
 # - Kommentare (//...) werden vor der Prüfung gestrippt, damit ein
 #   "// TODO: use XinputCaps" nicht fälschlich als Nutzung zählt.
-# - Wenn XinputCaps im Code verwendet wird (wie aktuell auf Zeile 207:
-#   "let caps = XinputCaps {"), bleibt der Import unangetastet — sonst
-#   Compile-Fehler "cannot find type XinputCaps".
+# - Wenn XinputCaps im Code verwendet wird (z.B. "let caps = XinputCaps {"),
+#   bleibt der Import unangetastet — sonst Compile-Fehler.
+#
+# Hinweis: In einem früheren Build meldete der Compiler "unused import:
+# XinputCaps" an Zeile 6, während auf Zeile 207 "let caps = XinputCaps {"
+# stand. Das kann bedeuten, dass XinputCaps dort ein lokales Struct im
+# selben Modul ist (also gar kein Import nötig). Dieser Patch entfernt
+# den Import in diesem Fall NICHT (Sicherheitsnetz greift), weil ein
+# Compile-Fehler schlimmer wäre als eine unused-import-Warnung.
 # ═════════════════════════════════════════════════════════════════════
 def patch_platform_unused_import():
     log("== crates/skate-game/src/input/platform.rs (unused XinputCaps) ==")
@@ -1298,13 +1390,11 @@ def patch_platform_unused_import():
         return
     text = PLATFORM_RS.read_text()
 
-    # Bereits gepatcht? (kein XinputCaps mehr, ControllerKind-only-Import)
     if ("use super::controller_kind::ControllerKind;" in text
             and "XinputCaps" not in text):
         log("  bereits gepatcht")
         return
 
-    # Beide Reihenfolgen abdecken, optionales trailing-comma
     patterns = [
         r'use\s+super::controller_kind::\{\s*ControllerKind\s*,\s*XinputCaps\s*,?\s*\}\s*;',
         r'use\s+super::controller_kind::\{\s*XinputCaps\s*,\s*ControllerKind\s*,?\s*\}\s*;',
@@ -1320,14 +1410,8 @@ def patch_platform_unused_import():
             "nicht gefunden – nichts zu tun")
         return
 
-    # SICHERHEITSNETZ: Wenn XinputCaps außerhalb der use-Zeile als
-    # echter Identifier referenziert wird (nicht nur in Kommentaren),
-    # darf der Import NICHT entfernt werden — sonst Compile-Fehler.
+    # SICHERHEITSNETZ
     rest = text[:m.start()] + text[m.end():]
-    # Line-Kommentare strippen (// bis Zeilenende), damit "// TODO: XinputCaps"
-    # nicht als Nutzung zählt. Block-Kommentare ignorieren wir bewusst —
-    # sie sind hier selten und der Fehlermodus (Import vorsichtig behalten)
-    # ist harmlos.
     rest_no_comments = re.sub(r'//[^\n]*', '', rest)
     if re.search(r'\bXinputCaps\b', rest_no_comments):
         log("  XinputCaps wird außerhalb der use-Zeile im Code verwendet – "
@@ -1400,6 +1484,7 @@ def main():
     prepare_root_cargo()
     prepare_game_cargo()
     prepare_main()
+    patch_main_allocator()
     prepare_app()
     prepare_fb0()
     prepare_headless()
