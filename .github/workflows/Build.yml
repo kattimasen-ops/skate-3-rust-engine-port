@@ -85,13 +85,15 @@ jobs:
         run: |
           set -euo pipefail
           apt-get install -y --no-install-recommends \
-            git python3 build-essential gcc-aarch64-linux-gnu g++-aarch64-linux-gnu \
+            git python3 python3-tomlkit python3-pip python3-venv \
+            build-essential gcc-aarch64-linux-gnu g++-aarch64-linux-gnu \
             binutils-aarch64-linux-gnu pkg-config \
             file patchelf zip unzip imagemagick \
             libasound2-dev:arm64 libudev-dev:arm64 \
             libdrm-dev:arm64 libgbm-dev:arm64 \
             libegl-dev:arm64 libgles2-mesa-dev:arm64
           python3 --version
+          python3 -c "import tomlkit; print('tomlkit', tomlkit.__version__)"
           git --version
 
       - name: Prepare-Skript vorhanden?
@@ -99,6 +101,7 @@ jobs:
           set -euo pipefail
           test -f tools/aarch64-prepare.py || { echo "::error::tools/aarch64-prepare.py fehlt"; exit 1; }
           echo "OK: tools/aarch64-prepare.py"
+          python3 -c "import tomlkit" && echo "OK: tomlkit importierbar"
 
       - name: wgpu v27.0.1 klonen
         run: |
@@ -147,6 +150,9 @@ jobs:
           echo "== skate-game default-features =="
           grep -q 'default = \[\]' crates/skate-game/Cargo.toml || exit 1
           echo "  OK"
+          echo ""
+          echo "== wgpu [workspace.package] =="
+          grep -A20 '^\[workspace.package\]' vendor/wgpu/Cargo.toml | head -20 || true
 
       - name: Cargo Build
         run: |
@@ -204,6 +210,10 @@ jobs:
             crates/skate-game/src/fb0_writer.rs
             crates/skate-game/src/headless_plugin.rs
             portmaster/
+            vendor/wgpu/Cargo.toml
+            vendor/wgpu/wgpu-hal/Cargo.toml
+            vendor/wgpu/wgpu-core/Cargo.toml
+            vendor/wgpu/wgpu-types/Cargo.toml
           if-no-files-found: warn
 
       - name: PortMaster ZIP
