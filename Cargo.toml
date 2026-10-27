@@ -28,11 +28,15 @@ skate-data = { path = "crates/skate-data" }
 [profile.dev]
 opt-level = 3
 
-# Release: OOM-sicher für 7 GB GitHub-Runner.
+# ═════════════════════════════════════════════════════════════════════
+# Release: OOM-sicher für 7 GB GitHub-Runner, aber max Performance
+# für das, was auf RK3326 tatsächlich zählt.
 #
 # lto = "thin" statt true (fat):
 #   - ~50 % weniger RAM beim Link, ~40 % schneller
 #   - ~95 % der Laufzeit-Performance von fat LTO
+#   - Wenn später bewiesen ist, dass der Link ohne OOM passt,
+#     kann auf lto = true umgestellt werden (+5–10 %)
 #
 # codegen-units = 4 statt 1:
 #   - pro Crate ~4x weniger Peak-RAM in LLVM
@@ -44,6 +48,7 @@ opt-level = 3
 #
 # Workspace-Crates (skate-*) bleiben bei opt-level = 3 für Game-Logik,
 # Physik, VM, Decompression.
+# ═════════════════════════════════════════════════════════════════════
 [profile.release]
 debug = 1
 strip = false
@@ -55,6 +60,36 @@ panic = "abort"
 [profile.release.package."*"]
 opt-level = 2
 codegen-units = 16
+
+# ═════════════════════════════════════════════════════════════════════
+# Optional: Performance-Booster für Hot Math/Physics Crates.
+# ═════════════════════════════════════════════════════════════════════
+#
+# AKTIVIEREN ERST NACH:
+#   1. Erfolgreichem Build (Binary vorhanden)
+#   2. Erstem Runtime-Test auf M9 Pro
+#   3. Profiling zeigt: Physik/Math ist der Flaschenhals (nicht GPU)
+#
+# WARNUNG: Diese Overrides erhöhen Peak-RAM beim Kompilieren. Auf einem
+# 7-GB-Runner kann das zusammen mit codegen-units=4 zu OOM führen.
+# Fallback wenn OOM: JOBS: "1" in .github/workflows/Build.yml.
+#
+# Erwarteter Gewinn auf Cortex-A35: 3–8 % in Szenen mit vielen Objekten
+# (Physik, Skinning, Animation), 0 % in GPU-limitierten Szenen.
+#
+# Zum Aktivieren die führenden "# " entfernen.
+#
+# [profile.release.package.glam]
+# opt-level = 3
+#
+# [profile.release.package.nalgebra]
+# opt-level = 3
+#
+# [profile.release.package.parry3d]
+# opt-level = 3
+#
+# [profile.release.package.rapier3d]
+# opt-level = 3
 
 [profile.dev.package."*"]
 opt-level = 3
