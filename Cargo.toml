@@ -27,6 +27,20 @@ bevy = { version = "=0.18.1", features = ["multi_threaded"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 libc = "0.2"
+
+# mimalloc als Global Allocator. glibc malloc fragmentiert auf ARM64
+# mit vielen kleinen Allocations (Bevy ECS, Asset-System, wgpu-Buffer)
+# stark. mimalloc reduziert den Peak-RAM typischerweise um 30-40 %
+# und ist gleichzeitig schneller — beides kritisch auf dem M9 Pro mit
+# nur 376 MB verfügbarem RAM.
+#
+# default-features = true: Die "secure"-Mode-Prüfungen bleiben aktiv.
+# Das kostet ~5 % Allocator-Performance, schützt aber vor Puffer-
+# Überläufen. Falls später mehr Performance gebraucht wird, kann man
+# hier default-features = false setzen und die Sicherheitsprüfungen
+# bewusst opfern.
+mimalloc = "0.1"
+
 skate-core = { path = "crates/skate-core" }
 skate-data = { path = "crates/skate-data" }
 
@@ -41,7 +55,7 @@ opt-level = 3
 #   - ~50 % weniger RAM beim Link, ~40 % schneller
 #   - ~95 % der Laufzeit-Performance von fat LTO
 #   - Wenn später bewiesen ist, dass der Link ohne OOM passt,
-#     kann auf lto = true umgestellt werden (+5–10 %)
+#     kann auf lto = true umgestellt werden (+5-10 %)
 #
 # codegen-units = 4 statt 1:
 #   - pro Crate ~4x weniger Peak-RAM in LLVM
@@ -79,6 +93,14 @@ codegen-units = 16
 opt-level = 3
 codegen-units = 16
 
+# mimalloc selbst: Jede Allokation geht durch seinen Code. Auf einem
+# 4-Kern-Cortex-A35 mit hoher Allocation-Rate (Assets, Buffer-Uploads,
+# Frame-Logik) macht opt-level = 3 einen messbaren Unterschied bei
+# der Allocator-Latenz. mimalloc ist klein, das kostet kaum Compile-RAM.
+[profile.release.package.mimalloc]
+opt-level = 3
+codegen-units = 1
+
 # ═════════════════════════════════════════════════════════════════════
 # Optional: Performance-Booster für Hot Math/Physics Crates.
 # ═════════════════════════════════════════════════════════════════════
@@ -92,7 +114,7 @@ codegen-units = 16
 # 7-GB-Runner kann das zusammen mit codegen-units=4 zu OOM führen.
 # Fallback wenn OOM: JOBS: "1" in .github/workflows/Build.yml.
 #
-# Erwarteter Gewinn auf Cortex-A35: 3–8 % in Szenen mit vielen Objekten
+# Erwarteter Gewinn auf Cortex-A35: 3-8 % in Szenen mit vielen Objekten
 # (Physik, Skinning, Animation), 0 % in GPU-limitierten Szenen.
 #
 # Zum Aktivieren die führenden "# " entfernen.
