@@ -1,12 +1,9 @@
-//! Headless-Rendering -> /dev/fb0.
+//! Headless-Rendering -> /dev/fb0 für RK3326 / M9 Pro.
 //!
-//! WICHTIG: Bevy kopiert die GPU-Textur NICHT automatisch zurueck in
-//! Assets<Image>. Dafuer brauchst du den ImageCopyPlugin aus dem
-//! offiziellen Beispiel:
-//! https://github.com/bevyengine/bevy/blob/main/examples/app/headless_renderer.rs
-//! Kopiere die Datei nach crates/skate-game/src/image_copy.rs und
-//! registriere sie in main.rs mit .add_plugins(image_copy::ImageCopyPlugin).
-//! Ohne diesen Plugin bleiben die fb0-Daten schwarz.
+//! Quellen:
+//! - R36S-Blog: https://blog.csdn.net/2601_96158891/article/details/163443328
+//! - Bevy-Headless-UI-Fix: https://jishuzhan.net/article/2092119687447105537
+//! - Mighty-Rodent-fb0: https://gitcode.com/k4m7v2pz/rust-bevy-mighty-rodent
 
 use bevy::prelude::*;
 use bevy::camera::{ImageRenderTarget, RenderTarget};
@@ -16,6 +13,10 @@ use bevy::render::render_resource::{
     Extent3d, TextureDescriptor, TextureDimension, TextureFormat, TextureUsages,
 };
 use bevy::render::view::RenderLayers;
+use bevy::render::view::window::screenshot::{
+    Screenshot, ScreenshotCaptured, ScreenshotPlugin,
+};
+use bevy::ui::IsDefaultUiCamera;
 
 use crate::fb0_writer::Fb0Writer;
 
@@ -23,16 +24,33 @@ pub struct HeadlessFbPlugin;
 
 impl Plugin for HeadlessFbPlugin {
     fn build(&self, app: &mut App) {
-        app.add_systems(Startup, setup_offscreen);
-        app.add_systems(Update, copy_to_fb0);
-        app.insert_resource(FbState::default());
+        app.add_plugins(ScreenshotPlugin)
+            .add_systems(Startup, (clear_fb0, setup_offscreen).chain())
+            .add_systems(Update, (request_screenshot, copy_to_fb0).chain());
     }
 }
 
+#[derive(Resource)]
+struct OffscreenTarget {
+    handle: Handle<Image>,
+}
+
 #[derive(Resource, Default)]
-pub struct FbState {
-    pub writer: Option<Fb0Writer>,
-    pub image_handle: Option<Handle<Image>>,
+struct FbState {
+    writer: Option<Fb0Writer>,
+}
+
+/// Einmaliges Schwarzschreiben beim Start (R36S-Erkenntnis).
+/// Verhindert, dass der letzte Frame des vorherigen Spiels sichtbar bleibt.
+fn clear_fb0(mut state: ResMut<FbState>) {
+    if let Ok(mut w) = Fb0Writer::open() {
+        let width = w.width();
+        let height = w.height();
+        let black = vec![0u8; (width * height * 4) as usize];
+        let _ = w.write_rgba8(&black, width, height);
+        info!("fb0: Startbildschirm auf Schwarz gesetzt");
+    }
+    state.writer = Fb0Writer::open().ok();
 }
 
 fn setup_offscreen(
@@ -40,11 +58,9 @@ fn setup_offscreen(
     mut images: ResMut<Assets<Image>>,
     mut state: ResMut<FbState>,
 ) {
-    let width = 448u32;
-    let height = 336u32;
     let size = Extent3d {
-        width,
-        height,
+        width: 448,
+        height: 336,
         depth_or_array_layers: 1,
     };
     let mut image = Image {
@@ -66,7 +82,6 @@ fn setup_offscreen(
     image.resize(size);
     let handle = images.add(image);
 
-    // Bevy 0.18: RenderTarget ist eine EIGENE Component, kein Camera-Feld.
     commands.spawn((
         Camera3d::default(),
         RenderTarget::Image(ImageRenderTarget {
@@ -75,10 +90,12 @@ fn setup_offscreen(
         }),
         NoIndirectDrawing,
         RenderLayers::default(),
+        // PFLICHT: Sonst filtert DefaultUiCamera::get() Image-Targets heraus
+        // und die gesamte UI bleibt unsichtbar (kein Fehler, kein Warn).
+        IsDefaultUiCamera,
     ));
+    commands.insert_resource(OffscreenTarget { handle });
 
-    state.image_handle = Some(handle);
-    state.writer = Fb0Writer::open().ok();
     if let Some(w) = &state.writer {
         info!("fb0: {}x{}, {} bpp", w.width(), w.height(), w.bits_per_pixel());
     } else {
@@ -86,16 +103,26 @@ fn setup_offscreen(
     }
 }
 
+fn request_screenshot(
+    mut commands: Commands,
+    camera: Query<Entity, With<Camera3d>>,
+    target: Res<OffscreenTarget>,
+) {
+    if let Ok(entity) = camera.single() {
+        commands.entity(entity).insert(Screenshot::image(target.handle.clone()));
+    }
+}
+
 fn copy_to_fb0(
-    images: Res<Assets<Image>>,
+    mut messages: MessageReader<ScreenshotCaptured>,
     mut state: ResMut<FbState>,
 ) {
-    let (Some(handle), Some(writer)) = (state.image_handle.as_ref(), state.writer.as_mut()) else {
-        return;
-    };
-    let Some(image) = images.get(handle) else { return; };
-    let Some(data) = image.data.as_ref() else { return; };
-    if let Err(e) = writer.write_rgba8(data, image.width(), image.height()) {
-        warn!("fb0 write: {e}");
+    for msg in messages.read() {
+        let Some(writer) = state.writer.as_mut() else { continue; };
+        let _ = writer.write_rgba8(
+            &msg.image.data,
+            msg.image.width(),
+            msg.image.height(),
+        );
     }
 }
