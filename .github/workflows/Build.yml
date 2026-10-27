@@ -162,40 +162,102 @@ jobs:
             if [ -f "$f" ]; then echo "  OK: $f"; else echo "  FEHLT: $f"; MISSING=1; fi
           done
           [ "$MISSING" -eq 0 ] || exit 1
+
           echo ""
           echo "== app.rs-Kernpatches =="
-          for marker in "primary_window: None" "Backends::GL" "Box::new(WgpuSettings" \
+          for marker in "primary_window: None" "Backends::GL" "Automatic(WgpuSettings" \
                         "disable::<bevy::winit::WinitPlugin>" "ScheduleRunnerPlugin" \
                         "GpuPreprocessingSupport" "ExitCondition::DontExit"; do
             if grep -q "$marker" crates/skate-game/src/app.rs; then
               echo "  OK: $marker"
             else
               echo "  FEHLT: $marker"
+              echo "  -- betroffene Zeilen (WgpuSettings/primary_window/Backends/ExitCondition):"
+              grep -nE 'WgpuSettings|primary_window|Backends::|ExitCondition|GpuPreprocessing|ScheduleRunner|WinitPlugin' \
+                crates/skate-game/src/app.rs || true
               exit 1
             fi
           done
+
+          echo ""
+          echo "== app.rs: Box::new(WgpuSettings darf NICHT vorhanden sein =="
+          if grep -q 'Box::new(WgpuSettings' crates/skate-game/src/app.rs; then
+            echo "  FEHLER: Box::new(WgpuSettings ist vorhanden (Bevy 0.18 erwartet WgpuSettings ohne Box)"
+            grep -n 'Box::new(WgpuSettings' crates/skate-game/src/app.rs || true
+            exit 1
+          fi
+          echo "  OK: kein Box::new(WgpuSettings"
+
           echo ""
           echo "== app.rs: kein Some(Window ...) mehr =="
           if grep -q 'primary_window: Some' crates/skate-game/src/app.rs; then
-            echo "  FEHLT: 'primary_window: Some' ist noch vorhanden"
+            echo "  FEHLER: 'primary_window: Some' ist noch vorhanden"
             grep -n 'primary_window' crates/skate-game/src/app.rs || true
             exit 1
           fi
           echo "  OK"
+
+          echo ""
+          echo "== main.rs: exit-Cast =="
+          if grep -q 'std::process::exit(code as i32)' crates/skate-game/src/main.rs; then
+            echo "  OK: code as i32"
+          elif grep -q 'std::process::exit(code)' crates/skate-game/src/main.rs; then
+            echo "  WARNUNG: std::process::exit(code) ohne as i32 (Compile-Fehler erwartet)"
+          else
+            echo "  OK: kein std::process::exit(code) gefunden"
+          fi
+
+          echo ""
+          echo "== headless_plugin.rs: Bevy-0.18-API =="
+          if grep -q 'R36S-Bevy0.18-Fix' crates/skate-game/src/headless_plugin.rs; then
+            echo "  OK: R36S-Bevy0.18-Fix"
+          elif grep -q 'Trigger<ScreenshotCaptured>' crates/skate-game/src/headless_plugin.rs; then
+            echo "  OK: Trigger<ScreenshotCaptured>"
+          elif grep -q 'MessageReader<ScreenshotCaptured>' crates/skate-game/src/headless_plugin.rs; then
+            echo "  FEHLER: MessageReader<ScreenshotCaptured> ist vorhanden, Prepare hat nicht ersetzt"
+            grep -n 'MessageReader\|ScreenshotCaptured' crates/skate-game/src/headless_plugin.rs || true
+            exit 1
+          else
+            echo "  WARNUNG: unbekannter Screenshot-Mechanismus (kein Trigger/MessageReader erkannt)"
+          fi
+
+          echo ""
+          echo "== wgpu-hal naga termcolor =="
+          if grep -q 'features = \["termcolor"\]' vendor/wgpu/wgpu-hal/Cargo.toml; then
+            echo "  OK: naga termcolor"
+          else
+            echo "  FEHLT: naga termcolor"
+            grep -n 'naga' vendor/wgpu/wgpu-hal/Cargo.toml || true
+            exit 1
+          fi
+
           echo ""
           echo "== wgpu-hal SSBO-Patch =="
-          grep -q "Mali-G31 R36S-Fix" vendor/wgpu/wgpu-hal/src/gles/adapter.rs || exit 1
-          echo "  OK"
+          if grep -q "Mali-G31 R36S-Fix" vendor/wgpu/wgpu-hal/src/gles/adapter.rs; then
+            echo "  OK: Mali-G31 R36S-Fix"
+          else
+            echo "  FEHLT: Mali-G31 R36S-Fix"
+            exit 1
+          fi
+
           echo ""
           echo "== skate-game default-features =="
-          grep -q 'default = \[\]' crates/skate-game/Cargo.toml || exit 1
-          echo "  OK"
+          if grep -q 'default = \[\]' crates/skate-game/Cargo.toml; then
+            echo "  OK: default = []"
+          else
+            echo "  FEHLT: default = []"
+            grep -n 'default' crates/skate-game/Cargo.toml || true
+            exit 1
+          fi
+
           echo ""
           echo "== outline-atomics =="
           if grep -qE 'target-feature=.*-outline-atomics' .cargo/config.toml; then
             echo "  OK: -outline-atomics"
           else
-            echo "::error::-outline-atomics fehlt in .cargo/config.toml"; exit 1
+            echo "::error::-outline-atomics fehlt in .cargo/config.toml"
+            cat .cargo/config.toml || true
+            exit 1
           fi
 
       - name: Cargo Build
@@ -259,6 +321,7 @@ jobs:
             vendor/wgpu/wgpu-core/Cargo.toml
             vendor/wgpu/wgpu-types/Cargo.toml
           if-no-files-found: warn
+          include-hidden-files: true
 
       - name: PortMaster ZIP
         if: always()
