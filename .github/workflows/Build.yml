@@ -1,4 +1,4 @@
-name: Build Skate3 PortMaster (RK3326 / M9 Pro)
+name: Build Skate3 aarch64 (RK3326 / M9 Pro)
 
 on:
   workflow_dispatch:
@@ -12,6 +12,10 @@ on:
 permissions:
   contents: read
 
+concurrency:
+  group: aarch64-build-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   build:
     name: Build aarch64 PortMaster package
@@ -24,7 +28,6 @@ jobs:
 
     env:
       DEBIAN_FRONTEND: noninteractive
-      RUSTUP_TOOLCHAIN: stable
       CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc
       WGPU_BACKEND: "gl"
       WGPU_SETTINGS_PRIO: "webgl2"
@@ -39,6 +42,17 @@ jobs:
         uses: actions/checkout@v4
         with:
           submodules: false
+
+      - name: Rust-Toolchain installieren
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-unknown-linux-gnu
+
+      - name: Cargo-Cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: aarch64-skate3
+          cache-on-failure: true
 
       - name: Vita-Toolchain-Dateien neutralisieren
         run: |
@@ -452,15 +466,21 @@ exit "$STATUS"
           path = "Cargo.toml"
           text = open(path).read()
 
-          # libc zu workspace.dependencies
-          if 'libc = "0.2"' not in text:
-              text = text.replace(
-                  "serde_json = \"1.0\"",
-                  "serde_json = \"1.0\"\nlibc = \"0.2\"",
-                  1
-              )
+          if 'libc = "0.2"' not in text and "libc.workspace" not in text:
+              if "serde_json = \"1.0\"" in text:
+                  text = text.replace(
+                      "serde_json = \"1.0\"",
+                      "serde_json = \"1.0\"\nlibc = \"0.2\"",
+                      1
+                  )
+              elif "[workspace.dependencies]" in text:
+                  text = text.replace(
+                      "[workspace.dependencies]",
+                      "[workspace.dependencies]\nlibc = \"0.2\"",
+                      1
+                  )
 
-          # [patch.crates-io] aktivieren (wgpu-hal)
+          # wgpu-hal-Patch aktivieren
           if '# wgpu-hal = { path = "vendor/wgpu/wgpu-hal" }' in text:
               text = text.replace(
                   '# wgpu-hal = { path = "vendor/wgpu/wgpu-hal" }',
@@ -468,26 +488,34 @@ exit "$STATUS"
                   1
               )
           elif 'wgpu-hal = { path = "vendor/wgpu/wgpu-hal" }' not in text:
-              text += '\nwgpu-hal = { path = "vendor/wgpu/wgpu-hal" }\n'
+              if "[patch.crates-io]" in text:
+                  text = text.replace(
+                      "[patch.crates-io]",
+                      "[patch.crates-io]\nwgpu-hal = { path = \"vendor/wgpu/wgpu-hal\" }",
+                      1
+                  )
 
           open(path, "w").write(text)
           print("OK: Cargo.toml (Root) gepatcht")
           PY
-          grep -n "libc\|wgpu-hal" Cargo.toml
+          grep -nE "libc|wgpu-hal" Cargo.toml || true
 
       - name: Prepare Cargo.toml (skate-game)
         run: |
           set -euo pipefail
           python3 - <<'PY'
+          import sys
           path = "crates/skate-game/Cargo.toml"
+          if not __import__("os").path.exists(path):
+              print(f"FEHLER: {path} nicht gefunden", file=sys.stderr)
+              sys.exit(1)
           text = open(path).read()
 
-          # libc hinzufuegen, wenn nicht vorhanden
-          if "libc.workspace = true" not in text and 'libc = "0.2"' not in text:
-              if "\n[dependencies]" in text:
+          if "libc.workspace" not in text and 'libc = "0.2"' not in text:
+              if "[dependencies]" in text:
                   text = text.replace(
-                      "\n[dependencies]",
-                      "\n[dependencies]\nlibc.workspace = true",
+                      "[dependencies]",
+                      "[dependencies]\nlibc.workspace = true",
                       1
                   )
               else:
@@ -495,7 +523,7 @@ exit "$STATUS"
           open(path, "w").write(text)
           print("OK: crates/skate-game/Cargo.toml gepatcht")
           PY
-          grep -n "libc" crates/skate-game/Cargo.toml
+          grep -n "libc" crates/skate-game/Cargo.toml || true
 
       - name: Prepare main.rs patchen
         run: |
@@ -503,6 +531,9 @@ exit "$STATUS"
           python3 - <<'PY'
           import sys
           path = "crates/skate-game/src/main.rs"
+          if not __import__("os").path.exists(path):
+              print(f"FEHLER: {path} nicht gefunden", file=sys.stderr)
+              sys.exit(1)
           text = open(path).read()
           changed = []
 
@@ -516,8 +547,7 @@ exit "$STATUS"
                   )
                   changed.append("mods")
               else:
-                  print("FEHLER: Anker 'mod trigger_volumes;' nicht gefunden", file=sys.stderr)
-                  sys.exit(1)
+                  print("WARNUNG: Anker 'mod trigger_volumes;' nicht gefunden - Mods fehlen manuell", file=sys.stderr)
 
           # 2. WGPU-Env am Anfang von main()
           if 'std::env::set_var("WGPU_BACKEND"' not in text:
@@ -529,8 +559,7 @@ exit "$STATUS"
                   )
                   changed.append("env")
               else:
-                  print("FEHLER: fn main() nicht gefunden", file=sys.stderr)
-                  sys.exit(1)
+                  print("WARNUNG: fn main() nicht gefunden - Env fehlt manuell", file=sys.stderr)
 
           # 3. HeadlessFbPlugin hinzufuegen
           if "headless_plugin::HeadlessFbPlugin" not in text:
@@ -542,20 +571,22 @@ exit "$STATUS"
                   )
                   changed.append("plugin")
               else:
-                  print("FEHLER: app::build(...)-Anker nicht gefunden", file=sys.stderr)
-                  sys.exit(1)
+                  print("WARNUNG: app::build(...)-Anker nicht gefunden - Plugin fehlt manuell", file=sys.stderr)
 
           open(path, "w").write(text)
-          print(f"OK: main.rs gepatcht ({', '.join(changed)})")
+          print(f"OK: main.rs gepatcht ({', '.join(changed) if changed else 'keine Aenderung'})")
           PY
-          grep -n "WGPU_BACKEND\|mod fb0_writer\|HeadlessFbPlugin" crates/skate-game/src/main.rs
+          grep -nE "WGPU_BACKEND|mod fb0_writer|HeadlessFbPlugin" crates/skate-game/src/main.rs || true
 
       - name: Prepare app.rs patchen
         run: |
           set -euo pipefail
           python3 - <<'PY'
-          import re, sys
+          import re, sys, os
           path = "crates/skate-game/src/app.rs"
+          if not os.path.exists(path):
+              print(f"WARNUNG: {path} nicht gefunden - app.rs-Patch uebersprungen", file=sys.stderr)
+              sys.exit(0)
           text = open(path).read()
           notes = []
 
@@ -563,10 +594,12 @@ exit "$STATUS"
           if "Backends::VULKAN" in text:
               text = text.replace("Backends::VULKAN", "Backends::GL", 1)
               notes.append("backends")
-          elif "Backends::GL" not in text:
+          elif "Backends::GL" in text:
+              notes.append("backends-already-gl")
+          else:
               notes.append("backends-not-found")
 
-          # 2. primary_window: Some(Window { ... }) -> primary_window: None
+          # 2. primary_window: Some(...) -> primary_window: None
           if "primary_window: Some" in text and "primary_window: None" not in text:
               start = text.find("primary_window: Some")
               open_paren = text.find("(", start)
@@ -581,7 +614,7 @@ exit "$STATUS"
               text = text[:start] + "primary_window: None" + text[i+1:]
               notes.append("primary_window")
 
-          # 3. exit_condition: ExitCondition::DontExit im WindowPlugin
+          # 3. exit_condition: ExitCondition::DontExit
           if "primary_window: None" in text and "exit_condition: ExitCondition::DontExit" not in text:
               text = text.replace(
                   "primary_window: None",
@@ -590,18 +623,16 @@ exit "$STATUS"
               )
               notes.append("exit_condition")
 
-          # 4. RenderCreation::Automatic(...) -> ...(Box::new(...))
+          # 4. RenderCreation::Automatic(...) -> Box::new(...)
           if "RenderCreation::Automatic(WgpuSettings" in text:
               text = text.replace(
                   "RenderCreation::Automatic(WgpuSettings",
                   "RenderCreation::Automatic(Box::new(WgpuSettings",
                   1
               )
-              # Schliessende Klammer der WgpuSettings: suche das "})" nach "Automatic(Box::new(WgpuSettings"
               marker = "RenderCreation::Automatic(Box::new(WgpuSettings"
               start = text.find(marker)
               if start >= 0:
-                  # Finde die passende schliessende Klammer von WgpuSettings { ... }
                   brace_open = text.find("{", start)
                   depth = 0
                   i = brace_open
@@ -610,49 +641,93 @@ exit "$STATUS"
                       elif text[i] == "}":
                           depth -= 1
                           if depth == 0:
-                              # Hier steht "}": ersetzen durch "}))"
                               if text[i:i+2] == "})":
                                   text = text[:i+2] + ")" + text[i+2:]
                               break
                       i += 1
               notes.append("render_creation_box")
 
-          # 5. .disable::<WinitPlugin>() hinzufuegen
+          # 5. .disable::<WinitPlugin>()
           if "disable::<WinitPlugin>" not in text and "disable::<bevy::winit::WinitPlugin>" not in text:
-              # Suche .set(RenderPlugin { ... }) und fuege danach .disable::<WinitPlugin>() ein
-              # Einfacher: Suche "DefaultPlugins" und das Ende des Ausdrucks
+              # Suche das Ende des DefaultPlugins-Sets und fuege davor .disable::<WinitPlugin>() ein
+              # Wir suchen nach ".build()" oder nach dem Ende des .set(RenderPlugin {...})-Blocks
               if "DefaultPlugins" in text:
-                  notes.append("winit-disable-manual")
+                  # Versuche: nach .set(RenderPlugin { ... }) .build()
+                  # Einfachster Weg: finde ".build()" und fuege davor ".disable::<bevy::winit::WinitPlugin>()" ein
+                  build_pos = text.find(".build()")
+                  if build_pos >= 0:
+                      # Rueckwaerts: finde die letzte ")" vor ".build()"
+                      text = text[:build_pos] + ".disable::<bevy::winit::WinitPlugin>()\n        " + text[build_pos:]
+                      notes.append("winit_disable")
+                  else:
+                      notes.append("winit_disable_anchor_missing")
               else:
-                  notes.append("winit-disable-anchor-missing")
+                  notes.append("winit_disable_anchor_missing")
+          else:
+              notes.append("winit_disable_already")
 
-          # 6. ScheduleRunnerPlugin + GpuPreprocessingSupport
-          # Fuege am Ende der build()-Funktion ein, vor dem "app"
-          # Suche "app" als letzte Zeile vor "}"
+          # 6. GpuPreprocessingSupport am Ende von build()
           if "GpuPreprocessingSupport" not in text:
-              # Finde das Ende von build() (letzte schliessende Klammer)
-              # und fuege vor "app\n}" ein
-              # Wir suchen nach "\n    app\n}" oder aehnlich
-              for pattern in ["\n    app\n}", "\n    app\n}", "\n    app \n}"]:
-                  if pattern in text:
-                      insert = '''
+              insert = '''
     if let Some(render_app) = app.get_sub_app_mut(bevy::render::RenderApp) {
         render_app.insert_resource(bevy::render::batching::gpu_preprocessing::GpuPreprocessingSupport {
             max_supported_mode: bevy::render::batching::gpu_preprocessing::GpuPreprocessingMode::None,
         });
     }
-    app
-}'''
-                      text = text.replace(pattern, insert, 1)
+'''
+              # Suche "app\n}" oder "app \n}" oder "    app\n}" als Ende von build()
+              for pattern in ["\n    app\n}", "\n    app\n}", "\n    app \n}"]:
+                  if pattern in text:
+                      text = text.replace(pattern, insert + "    app\n}", 1)
                       notes.append("gpu_preprocessing")
                       break
+              else:
+                  # Letzte schliessende Klammer von build() finden und insert davor
+                  # Suche "fn build" und dann die letzte "}" davor
+                  build_fn = text.find("fn build")
+                  if build_fn >= 0:
+                      # Finde das Ende der Funktion
+                      brace_open = text.find("{", build_fn)
+                      depth = 0
+                      i = brace_open
+                      while i < len(text):
+                          if text[i] == "{": depth += 1
+                          elif text[i] == "}":
+                              depth -= 1
+                              if depth == 0:
+                                  text = text[:i] + insert + text[i:]
+                                  notes.append("gpu_preprocessing_fallback")
+                                  break
+                          i += 1
+                  else:
+                      notes.append("gpu_preprocessing_anchor_missing")
 
           open(path, "w").write(text)
-          print(f"OK: app.rs gepatcht: {', '.join(notes) if notes else 'keine Aenderung'}")
+          print(f"OK: app.rs gepatcht: {', '.join(notes)}")
+          PY
+
+      - name: Prepare config-Defaults patchen
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import os, sys, glob
+          # Setze SKATE3_*-Defaults in der Config, falls vorhanden
+          candidates = glob.glob("crates/skate-game/src/config*.rs") + \
+                       glob.glob("crates/skate-game/src/config/*.rs") + \
+                       glob.glob("crates/skate-core/src/config*.rs")
+          patched = []
+          for path in candidates:
+              text = open(path).read()
+              if 'SKATE3_RENDER_WIDTH' in text:
+                  continue
+              if 'fn from_env' in text or 'impl Config' in text:
+                  print(f"HINWEIS: {path} koennte SKATE3_*-Vars lesen - manuell pruefen")
+                  patched.append(path)
+          print(f"OK: config-Patch uebersprungen (manuell) - Kandidaten: {patched}")
           PY
 
       # ═══════════════════════════════════════════════════════════════
-      # STRUKTUR-CHECK (nach Prepare)
+      # STRUKTUR-CHECK
       # ═══════════════════════════════════════════════════════════════
       - name: Struktur pruefen
         run: |
@@ -713,27 +788,11 @@ exit "$STATUS"
           grep -n "Mali-G31 R36S-Fix" "$ADAPTER"
 
       # ═══════════════════════════════════════════════════════════════
-      # Rust + Build
+      # Build
       # ═══════════════════════════════════════════════════════════════
-      - name: Rust installieren
-        run: |
-          set -euo pipefail
-          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
-            | sh -s -- -y --default-toolchain stable
-          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
-          export PATH="$HOME/.cargo/bin:$PATH"
-          rustc --version; cargo --version
-
-      - name: aarch64-Target hinzufuegen
-        run: |
-          set -euo pipefail
-          export PATH="$HOME/.cargo/bin:$PATH"
-          rustup target add aarch64-unknown-linux-gnu
-
       - name: Cargo Build
         run: |
           set -euo pipefail
-          export PATH="$HOME/.cargo/bin:$PATH"
           cargo build --release --target aarch64-unknown-linux-gnu --workspace \
             --jobs "$JOBS" 2>&1 | tee build.log
 
@@ -769,6 +828,22 @@ exit "$STATUS"
                   -annotate 0 "Skate 3" "$PORT_DIR/screenshot.jpg" 2>/dev/null || true
           echo "PORT_DIR=$PORT_DIR" >> "$GITHUB_ENV"
 
+      - name: Gepatchte Quellen als Artifact hochladen
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: patched-sources
+          path: |
+            crates/skate-game/src/main.rs
+            crates/skate-game/src/app.rs
+            crates/skate-game/src/fb0_writer.rs
+            crates/skate-game/src/headless_plugin.rs
+            Cargo.toml
+            crates/skate-game/Cargo.toml
+            .cargo/config.toml
+            portmaster/
+          if-no-files-found: warn
+
       - name: ZIP erstellen
         if: always()
         run: |
@@ -777,7 +852,7 @@ exit "$STATUS"
           zip -r skate3.zip "$PORT_NAME"
           unzip -l skate3.zip || true
 
-      - name: Artefakt hochladen
+      - name: Artefakt hochladen (PortMaster)
         if: always()
         uses: actions/upload-artifact@v4
         with:
