@@ -97,12 +97,8 @@ jobs:
       - name: Prepare-Skript vorhanden?
         run: |
           set -euo pipefail
-          if [ ! -f tools/aarch64-prepare.py ]; then
-            echo "::error::tools/aarch64-prepare.py fehlt im Repo"
-            exit 1
-          fi
-          echo "OK: tools/aarch64-prepare.py vorhanden"
-          python3 --version
+          test -f tools/aarch64-prepare.py || { echo "::error::tools/aarch64-prepare.py fehlt"; exit 1; }
+          echo "OK: tools/aarch64-prepare.py"
 
       - name: wgpu v27.0.1 klonen
         run: |
@@ -110,40 +106,47 @@ jobs:
           rm -rf vendor/wgpu
           git clone --depth 1 --branch v27.0.1 \
             https://github.com/gfx-rs/wgpu.git vendor/wgpu
-          test -f vendor/wgpu/wgpu-hal/src/gles/adapter.rs \
-            || { echo "::error::wgpu-hal/adapter.rs nicht geklont"; exit 1; }
-          test -f vendor/wgpu/Cargo.toml \
-            || { echo "::error::wgpu/Cargo.toml nicht geklont"; exit 1; }
+          test -f vendor/wgpu/wgpu-hal/src/gles/adapter.rs || { echo "::error::adapter.rs fehlt"; exit 1; }
+          test -f vendor/wgpu/Cargo.toml || { echo "::error::wgpu/Cargo.toml fehlt"; exit 1; }
           echo "OK: wgpu v27.0.1 geklont"
 
       - name: Prepare (alle Patches)
         run: |
           set -euo pipefail
           python3 tools/aarch64-prepare.py
-          echo ""
-          echo "== Verifikation nach Prepare =="
+
+      - name: Verifikation nach Prepare
+        run: |
+          set -euo pipefail
+          MISSING=0
           for f in .cargo/config.toml \
                    crates/skate-game/src/fb0_writer.rs \
                    crates/skate-game/src/headless_plugin.rs \
-                   portmaster/Skate3.sh \
-                   portmaster/port.json \
-                   portmaster/README.md \
-                   portmaster/gameinfo.xml; do
-            if [ -f "$f" ]; then
-              echo "  OK: $f"
+                   portmaster/Skate3.sh portmaster/port.json \
+                   portmaster/README.md portmaster/gameinfo.xml; do
+            if [ -f "$f" ]; then echo "  OK: $f"; else echo "  FEHLT: $f"; MISSING=1; fi
+          done
+          [ "$MISSING" -eq 0 ] || exit 1
+          echo ""
+          echo "== app.rs-Kernpatches =="
+          for marker in "primary_window: None" "Backends::GL" "Box::new(WgpuSettings" \
+                        "disable::<bevy::winit::WinitPlugin>" "ScheduleRunnerPlugin" \
+                        "GpuPreprocessingSupport"; do
+            if grep -q "$marker" crates/skate-game/src/app.rs; then
+              echo "  OK: $marker"
             else
-              echo "  FEHLT: $f"
+              echo "  FEHLT: $marker"
               exit 1
             fi
           done
           echo ""
-          echo "== wgpu-hal SSBO-Patch verifiziert =="
-          grep -q "Mali-G31 R36S-Fix" vendor/wgpu/wgpu-hal/src/gles/adapter.rs \
-            || { echo "::error::SSBO-Patch fehlt"; exit 1; }
+          echo "== wgpu-hal SSBO-Patch =="
+          grep -q "Mali-G31 R36S-Fix" vendor/wgpu/wgpu-hal/src/gles/adapter.rs || exit 1
           echo "  OK"
           echo ""
-          echo "== wgpu workspace.package =="
-          grep -A20 '^\[workspace.package\]' vendor/wgpu/Cargo.toml | head -20
+          echo "== skate-game default-features =="
+          grep -q 'default = \[\]' crates/skate-game/Cargo.toml || exit 1
+          echo "  OK"
 
       - name: Cargo Build
         run: |
@@ -155,19 +158,15 @@ jobs:
         run: |
           set -euo pipefail
           BIN=target/aarch64-unknown-linux-gnu/release/skate3rust
-          if [ ! -x "$BIN" ]; then
-            echo "::error::$BIN fehlt"
-            exit 1
-          fi
+          if [ ! -x "$BIN" ]; then echo "::error::$BIN fehlt"; exit 1; fi
           file "$BIN"
           MAX=$(aarch64-linux-gnu-objdump -T "$BIN" \
             | { grep -oE 'GLIBC_[0-9][0-9.]*' || true; } \
             | sed 's/^GLIBC_//' | sort -Vu | tail -1)
-          echo "Hoechste GLIBC-Version: ${MAX:-keine}"
+          echo "GLIBC: ${MAX:-keine}"
           if [ -n "$MAX" ] && \
              [ "$(printf '%s\n%s\n' "$MAX_GLIBC" "$MAX" | sort -V | tail -1)" != "$MAX_GLIBC" ]; then
-            echo "::error::Braucht GLIBC_$MAX, ArkOS hat nur $MAX_GLIBC"
-            exit 1
+            echo "::error::Braucht GLIBC_$MAX, ArkOS hat $MAX_GLIBC"; exit 1
           fi
 
       - name: PortMaster-Paket vorbereiten
@@ -178,33 +177,18 @@ jobs:
           PORT_DIR="$STAGE/$PORT_NAME"
           rm -rf "$STAGE"
           mkdir -p "$PORT_DIR/$PORT_NAME/assets"
-
           BIN="target/aarch64-unknown-linux-gnu/release/skate3rust"
           if [ -x "$BIN" ]; then
             install -m 755 "$BIN" "$PORT_DIR/$PORT_NAME/skate3"
             strip --strip-unneeded "$PORT_DIR/$PORT_NAME/skate3" 2>/dev/null || true
-            echo "Binary installiert: $PORT_DIR/$PORT_NAME/skate3"
-          else
-            echo "::warning::skate3rust-Binary fehlt, Paket ohne Binary"
           fi
-
           touch "$PORT_DIR/$PORT_NAME/assets/.gitkeep"
-
-          cp portmaster/Skate3.sh    "$PORT_DIR/" 2>/dev/null || true
-          cp portmaster/port.json    "$PORT_DIR/" 2>/dev/null || true
-          cp portmaster/README.md    "$PORT_DIR/" 2>/dev/null || true
-          cp portmaster/gameinfo.xml "$PORT_DIR/" 2>/dev/null || true
+          cp portmaster/Skate3.sh portmaster/port.json \
+             portmaster/README.md portmaster/gameinfo.xml "$PORT_DIR/" 2>/dev/null || true
           chmod 755 "$PORT_DIR/Skate3.sh" 2>/dev/null || true
-
-          # 640x480 schwarzes JPEG (PortMaster-Anforderung)
           convert -size 640x480 xc:black -gravity center -fill white \
                   -pointsize 48 -annotate 0 "Skate 3" \
-                  "$PORT_DIR/screenshot.jpg" 2>/dev/null || \
-            convert -size 640x480 xc:black "$PORT_DIR/screenshot.jpg" 2>/dev/null || true
-
-          echo ""
-          echo "== dist/ =="
-          find "$STAGE" -type f -o -type d | sort
+                  "$PORT_DIR/screenshot.jpg" 2>/dev/null || true
 
       - name: patched-sources Artifact
         if: always()
@@ -229,12 +213,7 @@ jobs:
           cd "$GITHUB_WORKSPACE/dist"
           if [ -d "$PORT_NAME" ]; then
             zip -r "skate3.zip" "$PORT_NAME"
-            echo "== ZIP-Inhalt =="
             unzip -l skate3.zip || true
-            echo ""
-            ls -lah skate3.zip
-          else
-            echo "::warning::Kein dist/$PORT_NAME – ZIP uebersprungen"
           fi
 
       - name: PortMaster Artifact
