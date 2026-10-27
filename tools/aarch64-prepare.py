@@ -2,12 +2,23 @@
 """
 aarch64-prepare.py — bereitet das Skate-3-Repo für RK3326/M9 Pro vor.
 
-Idempotent: bereits gepatchte Dateien werden übersprungen.
-Alle Patches werden geloggt; Fehlschläge kritischer Patches -> Exit 1.
+Wendet an:
+  1. .cargo/config.toml (Cross-Toolchain, Cortex-A35-Flags)
+  2. Root-Cargo.toml (libc, wgpu-hal als Patch)
+  3. skate-game/Cargo.toml (libc.workspace)
+  4. main.rs (Module, WGPU-Env, HeadlessFbPlugin)
+  5. app.rs (Backends::GL, primary_window: None, winit-disable, GPU-Preproc)
+  6. fb0_writer.rs (nur wenn fehlt)
+  7. headless_plugin.rs (nur wenn fehlt)
+  8. portmaster/ (nur wenn fehlt oder --force)
+  9. vendor/wgpu/Cargo.toml (fehlende [workspace.package]-Felder ergänzen)
+ 10. vendor/wgpu/wgpu-hal/src/gles/adapter.rs (Mali-G31 SSBO-Fix)
+
+Idempotent. Fehlschläge kritischer Patches → Exit 1.
 
 Aufruf:
     python3 tools/aarch64-prepare.py
-    python3 tools/aarch64-prepare.py --check    # nur prüfen, nicht schreiben
+    python3 tools/aarch64-prepare.py --check    # nur prüfen
     python3 tools/aarch64-prepare.py --force    # existierende Dateien überschreiben
 """
 
@@ -18,21 +29,21 @@ import sys
 from pathlib import Path
 
 ROOT = Path.cwd()
-GAME_SRC   = ROOT / "crates" / "skate-game" / "src"
-GAME_CARGO = ROOT / "crates" / "skate-game" / "Cargo.toml"
-ROOT_CARGO = ROOT / "Cargo.toml"
-MAIN_RS    = GAME_SRC / "main.rs"
-APP_RS     = GAME_SRC / "app.rs"
-FB0_RS     = GAME_SRC / "fb0_writer.rs"
+GAME_SRC    = ROOT / "crates" / "skate-game" / "src"
+GAME_CARGO  = ROOT / "crates" / "skate-game" / "Cargo.toml"
+ROOT_CARGO  = ROOT / "Cargo.toml"
+MAIN_RS     = GAME_SRC / "main.rs"
+APP_RS      = GAME_SRC / "app.rs"
+FB0_RS      = GAME_SRC / "fb0_writer.rs"
 HEADLESS_RS = GAME_SRC / "headless_plugin.rs"
-PORTMASTER = ROOT / "portmaster"
-CARGO_CFG  = ROOT / ".cargo" / "config.toml"
+PORTMASTER  = ROOT / "portmaster"
+CARGO_CFG   = ROOT / ".cargo" / "config.toml"
+WGPU_ROOT   = ROOT / "vendor" / "wgpu"
+WGPU_HAL    = WGPU_ROOT / "wgpu-hal"
 
 CHECK_ONLY = False
 FORCE = False
-notes = []
-warnings = []
-errors = []
+warnings, errors = [], []
 
 def log(msg): print(f"[prepare] {msg}")
 def warn(msg):
@@ -42,47 +53,38 @@ def fail(msg):
     errors.append(msg)
     print(f"[prepare] FEHLER: {msg}", file=sys.stderr)
 
-# ─────────────────────────────────────────────────────────────────────
-# Hilfsfunktionen
-# ─────────────────────────────────────────────────────────────────────
 
 def find_matching(text, open_idx, open_char='{', close_char='}'):
-    """Index der passenden schließenden Klammer oder -1."""
-    if text[open_idx] != open_char:
+    if open_idx >= len(text) or text[open_idx] != open_char:
         return -1
     depth = 0
     i = open_idx
     while i < len(text):
         c = text[i]
-        if c == open_char:
-            depth += 1
+        if c == open_char: depth += 1
         elif c == close_char:
             depth -= 1
-            if depth == 0:
-                return i
+            if depth == 0: return i
         i += 1
     return -1
 
-def write_file(path, content, marker=None):
-    """Schreibt Datei, wenn sie fehlt oder --force. Bei marker: nur überschreiben, wenn Marker fehlt."""
+
+def write_if_missing(path, content):
     if path.exists() and not FORCE:
-        if marker and marker not in path.read_text():
-            log(f"überschrieben (Marker '{marker}' fehlt): {path}")
-        else:
-            log(f"übersprungen (existiert): {path}")
-            return False
+        log(f"übersprungen (existiert): {path.relative_to(ROOT)}")
+        return False
     if CHECK_ONLY:
-        log(f"würde schreiben: {path}")
+        log(f"würde schreiben: {path.relative_to(ROOT)}")
         return False
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(content)
-    log(f"geschrieben: {path}")
+    log(f"geschrieben: {path.relative_to(ROOT)}")
     return True
 
+
 def patch_file(path, patch_fn, description):
-    """Wendet patch_fn auf path an. patch_fn gibt (new_text, changed: bool) zurück."""
     if not path.exists():
-        fail(f"{path} nicht gefunden ({description})")
+        fail(f"{path.relative_to(ROOT)} nicht gefunden ({description})")
         return False
     old = path.read_text()
     new, changed = patch_fn(old)
@@ -96,10 +98,10 @@ def patch_file(path, patch_fn, description):
     log(f"gepatcht: {description}")
     return True
 
-# ─────────────────────────────────────────────────────────────────────
-# 1. .cargo/config.toml
-# ─────────────────────────────────────────────────────────────────────
 
+# ═════════════════════════════════════════════════════════════════════
+# 1. .cargo/config.toml
+# ═════════════════════════════════════════════════════════════════════
 CARGO_CONFIG = """\
 [target.aarch64-unknown-linux-gnu]
 linker = "aarch64-linux-gnu-gcc"
@@ -120,27 +122,27 @@ WGPU_SETTINGS_PRIO = "webgl2"
 
 def prepare_cargo_config():
     log("== .cargo/config.toml ==")
-    write_file(CARGO_CFG, CARGO_CONFIG)
+    write_if_missing(CARGO_CFG, CARGO_CONFIG)
 
-# ─────────────────────────────────────────────────────────────────────
-# 2. Root-Cargo.toml: libc + wgpu-hal-Patch
-# ─────────────────────────────────────────────────────────────────────
 
+# ═════════════════════════════════════════════════════════════════════
+# 2. Root-Cargo.toml
+# ═════════════════════════════════════════════════════════════════════
 def patch_root_cargo(text):
     changed = False
     if 'libc = "0.2"' not in text and "libc.workspace" not in text:
         if 'serde_json = "1.0"' in text:
             text = text.replace('serde_json = "1.0"',
                                 'serde_json = "1.0"\nlibc = "0.2"', 1)
+            changed = True
         elif "[workspace.dependencies]" in text:
             text = text.replace("[workspace.dependencies]",
                                 '[workspace.dependencies]\nlibc = "0.2"', 1)
+            changed = True
         else:
-            fail("Root-Cargo.toml: kein Anker für libc gefunden")
+            fail("Root-Cargo.toml: kein Anker für libc")
             return text, False
-        changed = True
 
-    # wgpu-hal-Patch aktivieren
     if '# wgpu-hal = { path = "vendor/wgpu/wgpu-hal" }' in text:
         text = text.replace('# wgpu-hal = { path = "vendor/wgpu/wgpu-hal" }',
                             'wgpu-hal = { path = "vendor/wgpu/wgpu-hal" }', 1)
@@ -148,26 +150,27 @@ def patch_root_cargo(text):
     elif 'wgpu-hal = { path = "vendor/wgpu/wgpu-hal" }' not in text:
         if "[patch.crates-io]" in text:
             text = text.replace("[patch.crates-io]",
-                                '[patch.crates-io]\nwgpu-hal = { path = "vendor/wgpu/wgpu-hal" }', 1)
+                '[patch.crates-io]\nwgpu-hal = { path = "vendor/wgpu/wgpu-hal" }', 1)
             changed = True
         else:
-            warn("Root-Cargo.toml: [patch.crates-io] fehlt")
+            warn("Root-Cargo.toml: [patch.crates-io] fehlt – wgpu-hal-Patch nicht aktiviert")
     return text, changed
 
 def prepare_root_cargo():
     log("== Root-Cargo.toml ==")
+    if not WGPU_ROOT.exists():
+        warn("vendor/wgpu fehlt – wgpu-hal-Patch wird NICHT aktiviert")
     patch_file(ROOT_CARGO, patch_root_cargo, "root Cargo.toml")
 
-# ─────────────────────────────────────────────────────────────────────
-# 3. skate-game/Cargo.toml: libc
-# ─────────────────────────────────────────────────────────────────────
 
+# ═════════════════════════════════════════════════════════════════════
+# 3. skate-game/Cargo.toml
+# ═════════════════════════════════════════════════════════════════════
 def patch_game_cargo(text):
     if "libc.workspace" in text or 'libc = "0.2"' in text:
         return text, False
     if "[dependencies]" in text:
-        text = text.replace("[dependencies]",
-                            "[dependencies]\nlibc.workspace = true", 1)
+        text = text.replace("[dependencies]", "[dependencies]\nlibc.workspace = true", 1)
     else:
         text += "\n[dependencies]\nlibc.workspace = true\n"
     return text, True
@@ -175,41 +178,35 @@ def patch_game_cargo(text):
 def prepare_game_cargo():
     log("== skate-game/Cargo.toml ==")
     if not GAME_CARGO.exists():
-        fail(f"{GAME_CARGO} nicht gefunden")
+        fail(f"{GAME_CARGO.relative_to(ROOT)} nicht gefunden")
         return
     patch_file(GAME_CARGO, patch_game_cargo, "skate-game Cargo.toml")
 
-# ─────────────────────────────────────────────────────────────────────
-# 4. main.rs: Module, Env-Vars, Plugin
-# ─────────────────────────────────────────────────────────────────────
 
+# ═════════════════════════════════════════════════════════════════════
+# 4. main.rs
+# ═════════════════════════════════════════════════════════════════════
 def patch_main(text):
     changed = False
 
-    # 4a. Module
     if "mod fb0_writer;" not in text:
         if "mod trigger_volumes;" in text:
-            text = text.replace(
-                "mod trigger_volumes;",
+            text = text.replace("mod trigger_volumes;",
                 "mod trigger_volumes;\nmod fb0_writer;\nmod headless_plugin;", 1)
             changed = True
         else:
             warn("main.rs: 'mod trigger_volumes;' fehlt – Module nicht eingefügt")
-            warn("        Manuell einfügen: 'mod fb0_writer; mod headless_plugin;'")
 
-    # 4b. WGPU-Env
     if 'std::env::set_var("WGPU_BACKEND"' not in text:
         if "fn main() -> bevy::app::AppExit {" in text:
-            text = text.replace(
-                "fn main() -> bevy::app::AppExit {",
+            text = text.replace("fn main() -> bevy::app::AppExit {",
                 'fn main() -> bevy::app::AppExit {\n'
                 '    std::env::set_var("WGPU_BACKEND", "gl");\n'
                 '    std::env::set_var("WGPU_SETTINGS_PRIO", "webgl2");', 1)
             changed = True
         else:
-            warn("main.rs: 'fn main() -> bevy::app::AppExit {' fehlt – Env nicht eingefügt")
+            warn("main.rs: 'fn main() -> bevy::app::AppExit {' fehlt")
 
-    # 4c. Plugin
     if "headless_plugin::HeadlessFbPlugin" not in text:
         if "let mut app = app::build(config, manifest, graphs, physics, skater);" in text:
             text = text.replace(
@@ -226,74 +223,58 @@ def prepare_main():
     log("== main.rs ==")
     patch_file(MAIN_RS, patch_main, "main.rs")
 
-# ─────────────────────────────────────────────────────────────────────
-# 5. app.rs: Backends, Box, primary_window, exit_condition, winit, GPU-Preproc
-# ─────────────────────────────────────────────────────────────────────
 
+# ═════════════════════════════════════════════════════════════════════
+# 5. app.rs
+# ═════════════════════════════════════════════════════════════════════
 def patch_app(text):
     changed = False
 
-    # 5a. Backends::VULKAN -> GL
+    # Backends::VULKAN → GL
     if "Backends::VULKAN" in text:
         text = text.replace("Backends::VULKAN", "Backends::GL", 1)
         changed = True
 
-    # 5b. RenderCreation::Automatic(WgpuSettings { ... }) -> Box::new(...)
+    # RenderCreation::Automatic(WgpuSettings { ... }) → Box::new(...)
     marker = "RenderCreation::Automatic(WgpuSettings"
     if marker in text:
         idx = text.find(marker)
-        # Ersetze den Anfang
-        new_text = (text[:idx]
-                    + "RenderCreation::Automatic(Box::new(WgpuSettings"
-                    + text[idx + len(marker):])
-        # Finde die passende schließende Klammer von Automatic(
+        new_text = text[:idx] + "RenderCreation::Automatic(Box::new(WgpuSettings" + text[idx + len(marker):]
         auto_start = idx + len("RenderCreation::Automatic")
         if auto_start < len(new_text) and new_text[auto_start] == '(':
             close = find_matching(new_text, auto_start, '(', ')')
             if close > 0:
-                # Füge ")" vor der schließenden Klammer ein
                 new_text = new_text[:close] + ")" + new_text[close:]
                 text = new_text
                 changed = True
-            else:
-                warn("app.rs: Automatic(-Klammer nicht gefunden")
 
-    # 5c. primary_window: Some(Window { ... }) -> primary_window: None
+    # primary_window: Some(Window { ... }) → primary_window: None
     if "primary_window: Some" in text and "primary_window: None" not in text:
         idx = text.find("primary_window: Some")
-        some_end = idx + len("primary_window: Some")
-        # Springe über Whitespace zur '('
-        j = some_end
-        while j < len(text) and text[j] in ' \t':
-            j += 1
+        j = idx + len("primary_window: Some")
+        while j < len(text) and text[j] in ' \t': j += 1
         if j < len(text) and text[j] == '(':
             close = find_matching(text, j, '(', ')')
             if close > 0:
                 text = text[:idx] + "primary_window: None" + text[close + 1:]
                 changed = True
-            else:
-                warn("app.rs: primary_window-Some-Klammer nicht gefunden")
 
-    # 5d. exit_condition: ExitCondition::DontExit
+    # exit_condition
     if "primary_window: None" in text and "ExitCondition::DontExit" not in text:
-        text = text.replace(
-            "primary_window: None",
-            "primary_window: None,\n            exit_condition: ExitCondition::DontExit",
-            1)
+        text = text.replace("primary_window: None",
+            "primary_window: None,\n            exit_condition: ExitCondition::DontExit", 1)
         changed = True
 
-    # 5e. .disable::<WinitPlugin>() vor .build()
+    # .disable::<WinitPlugin>()
     if "disable::<WinitPlugin>" not in text and "disable::<bevy::winit::WinitPlugin>" not in text:
         if ".build()" in text:
             pos = text.find(".build()")
-            text = (text[:pos]
-                    + ".disable::<bevy::winit::WinitPlugin>()\n        "
-                    + text[pos:])
+            text = text[:pos] + ".disable::<bevy::winit::WinitPlugin>()\n        " + text[pos:]
             changed = True
         else:
-            warn("app.rs: '.build()' fehlt – .disable::<WinitPlugin>() nicht eingefügt")
+            warn("app.rs: '.build()' fehlt – winit-disable nicht eingefügt")
 
-    # 5f. GpuPreprocessingSupport am Ende von build()
+    # GpuPreprocessingSupport am Ende von build()
     if "GpuPreprocessingSupport" not in text:
         idx = text.find("fn build")
         if idx >= 0:
@@ -320,15 +301,15 @@ def patch_app(text):
 def prepare_app():
     log("== app.rs ==")
     if not APP_RS.exists():
-        fail(f"{APP_RS} nicht gefunden – app.rs-Patch kritisch")
+        fail(f"{APP_RS.relative_to(ROOT)} nicht gefunden – app.rs-Patch kritisch")
         return
     patch_file(APP_RS, patch_app, "app.rs")
 
-# ─────────────────────────────────────────────────────────────────────
-# 6. fb0_writer.rs (nur wenn fehlt)
-# ─────────────────────────────────────────────────────────────────────
 
-FB0_RS_CONTENT = r'''//! /dev/fb0-Writer für RK3326 / M9 Pro.
+# ═════════════════════════════════════════════════════════════════════
+# 6. fb0_writer.rs (nur wenn fehlt)
+# ═════════════════════════════════════════════════════════════════════
+FB0_RS_FALLBACK = r'''//! /dev/fb0-Writer für RK3326 / M9 Pro.
 use std::fs::{File, OpenOptions};
 use std::io;
 use std::os::unix::io::AsRawFd;
@@ -443,13 +424,16 @@ impl Drop for Fb0Writer {
 
 def prepare_fb0():
     log("== fb0_writer.rs ==")
-    write_file(FB0_RS, FB0_RS_CONTENT)
+    if FB0_RS.exists():
+        log("  existiert bereits (deine Version wird verwendet)")
+        return
+    write_if_missing(FB0_RS, FB0_RS_FALLBACK)
 
-# ─────────────────────────────────────────────────────────────────────
+
+# ═════════════════════════════════════════════════════════════════════
 # 7. headless_plugin.rs (nur wenn fehlt)
-# ─────────────────────────────────────────────────────────────────────
-
-HEADLESS_RS_CONTENT = r'''//! Headless-Rendering -> /dev/fb0 via Screenshot-API (Bevy 0.18).
+# ═════════════════════════════════════════════════════════════════════
+HEADLESS_RS_FALLBACK = r'''//! Headless-Rendering -> /dev/fb0 via Screenshot-API (Bevy 0.18).
 use bevy::prelude::*;
 use bevy::camera::{ImageRenderTarget, RenderTarget};
 use bevy::math::FloatOrd;
@@ -482,9 +466,7 @@ struct OffscreenTarget { handle: Handle<Image> }
 struct FbState { writer: Option<Fb0Writer> }
 
 fn clear_fb0(mut state: ResMut<FbState>) {
-    if let Ok(mut w) = Fb0Writer::open() {
-        let _ = w.clear();
-    }
+    if let Ok(mut w) = Fb0Writer::open() { let _ = w.clear(); }
     state.writer = Fb0Writer::open().ok();
 }
 
@@ -521,7 +503,7 @@ fn setup_offscreen(
     if let Some(w) = &state.writer {
         info!("fb0: {}x{}, {} bpp", w.width(), w.height(), w.bits_per_pixel());
     } else {
-        warn!("fb0 konnte nicht geoeffnet werden; Ausgabe nur ueber Log");
+        warn!("fb0 konnte nicht geoeffnet werden");
     }
 }
 
@@ -548,12 +530,15 @@ fn copy_to_fb0(
 
 def prepare_headless():
     log("== headless_plugin.rs ==")
-    write_file(HEADLESS_RS, HEADLESS_RS_CONTENT)
+    if HEADLESS_RS.exists():
+        log("  existiert bereits (deine Version wird verwendet)")
+        return
+    write_if_missing(HEADLESS_RS, HEADLESS_RS_FALLBACK)
 
-# ─────────────────────────────────────────────────────────────────────
+
+# ═════════════════════════════════════════════════════════════════════
 # 8. portmaster/
-# ─────────────────────────────────────────────────────────────────────
-
+# ═════════════════════════════════════════════════════════════════════
 PORT_JSON = '''\
 {
   "version": 4,
@@ -645,8 +630,6 @@ if [ -n "${SDL_GAMECONTROLLERCONFIG:-}" ]; then
     export SDL_GAMECONTROLLERCONFIG_FILE="/tmp/skate3-gamecontrollerdb.txt"
     printf '%s\n' "$SDL_GAMECONTROLLERCONFIG" > "$SDL_GAMECONTROLLERCONFIG_FILE" 2>/dev/null || true
 fi
-
-# Mali-Libs: FAT32 unterstuetzt keine Symlinks -> cp -f
 SYSTEM_MALI=""
 for candidate in \
     /usr/lib/aarch64-linux-gnu/libmali-bifrost-g31-rxp0-gbm.so \
@@ -666,7 +649,6 @@ if [ -n "$SYSTEM_MALI" ]; then
 else
     export LD_LIBRARY_PATH="$GAMEDIR:/usr/lib/aarch64-linux-gnu:${LD_LIBRARY_PATH:-}"
 fi
-
 export MALLOC_TRIM_THRESHOLD_=131072
 export MALLOC_MMAP_THRESHOLD_=131072
 export MALLOC_ARENA_MAX=2
@@ -676,14 +658,12 @@ export SKATE3_NO_VSYNC=1
 export SKATE3_NO_SHADOW=1
 export SKATE3_RENDER_WIDTH=448
 export SKATE3_RENDER_HEIGHT=336
-
 cpu_gov=""
 for c in /sys/devices/system/cpu/cpufreq/policy0/scaling_governor \
          /sys/devices/system/cpu/cpu0/cpufreq/scaling_governor; do
     if [ -w "$c" ]; then cpu_gov="$c"; break; fi
 done
 if [ -n "$cpu_gov" ]; then echo performance > "$cpu_gov" 2>/dev/null || true; fi
-
 GPTOKEYB=""
 for c in "$controlfolder/gptokeyb" /opt/system/Tools/PortMaster/gptokeyb \
          /usr/local/bin/gptokeyb /usr/bin/gptokeyb; do
@@ -694,11 +674,9 @@ if [ -n "$GPTOKEYB" ]; then
     "$GPTOKEYB" "$GAMEDIR/skate3" -k skate3 &
     GPTOKEYB_PID=$!
 fi
-
 cd "$GAMEDIR"
 STATUS=0
 ./skate3 "$@" || STATUS=$?
-
 if [ -n "$GPTOKEYB_PID" ]; then kill -TERM "$GPTOKEYB_PID" 2>/dev/null || true; fi
 if [ -n "$cpu_gov" ]; then echo ondemand > "$cpu_gov" 2>/dev/null || true; fi
 exit "$STATUS"
@@ -706,18 +684,211 @@ exit "$STATUS"
 
 def prepare_portmaster():
     log("== portmaster/ ==")
-    write_file(PORTMASTER / "port.json", PORT_JSON)
-    write_file(PORTMASTER / "README.md", README_MD)
-    write_file(PORTMASTER / "gameinfo.xml", GAMEINFO_XML)
+    write_if_missing(PORTMASTER / "port.json", PORT_JSON)
+    write_if_missing(PORTMASTER / "README.md", README_MD)
+    write_if_missing(PORTMASTER / "gameinfo.xml", GAMEINFO_XML)
     launcher = PORTMASTER / "Skate3.sh"
-    write_file(launcher, LAUNCHER)
+    write_if_missing(launcher, LAUNCHER)
     if launcher.exists() and not CHECK_ONLY:
-        os.chmod(launcher, 0o755)
+        try:
+            os.chmod(launcher, 0o755)
+        except OSError as e:
+            warn(f"chmod auf {launcher.relative_to(ROOT)} fehlgeschlagen: {e}")
 
-# ─────────────────────────────────────────────────────────────────────
+
+# ═════════════════════════════════════════════════════════════════════
+# 9. wgpu-Workspace-Vererbung fixen
+# ═════════════════════════════════════════════════════════════════════
+# Felder, die wgpu-Crates via `field.workspace = true` erben können.
+INHERITED_DEFAULTS = {
+    "authors": '["wgpu developers"]',
+    "version": '"27.0.1"',
+    "edition": '"2021"',
+    "license": '"MIT OR Apache-2.0"',
+    "repository": '"https://github.com/gfx-rs/wgpu"',
+    "rust-version": '"1.82"',
+    "homepage": '"https://wgpu.rs/"',
+}
+
+def collect_used_inherited_fields():
+    """Sammelt alle Felder, die in vendor/wgpu/**.Cargo.toml per .workspace = true geerbt werden."""
+    used = set()
+    pattern = re.compile(r"^([A-Za-z0-9_-]+)\.workspace\s*=\s*true", re.MULTILINE)
+    for cargo_toml in WGPU_ROOT.rglob("Cargo.toml"):
+        if cargo_toml == WGPU_ROOT / "Cargo.toml":
+            continue
+        text = cargo_toml.read_text()
+        for match in pattern.finditer(text):
+            used.add(match.group(1))
+    return used
+
+
+def fix_wgpu_workspace():
+    log("== wgpu workspace.package fixen ==")
+    if not WGPU_ROOT.exists():
+        warn(f"{WGPU_ROOT.relative_to(ROOT)} fehlt – wgpu nicht geklont?")
+        return
+
+    wgpu_root_toml = WGPU_ROOT / "Cargo.toml"
+    if not wgpu_root_toml.exists():
+        fail(f"{wgpu_root_toml.relative_to(ROOT)} fehlt")
+        return
+
+    used_fields = collect_used_inherited_fields()
+    log(f"  In wgpu-Crates via .workspace=true geerbt: {sorted(used_fields) or 'keine'}")
+
+    if not used_fields:
+        log("  Kein Handlungsbedarf")
+        return
+
+    text = wgpu_root_toml.read_text()
+
+    # Existiert [workspace.package]?
+    has_section = "[workspace.package]" in text
+
+    # Sammle bereits definierte Felder
+    existing = set()
+    if has_section:
+        in_section = False
+        for line in text.splitlines():
+            s = line.strip()
+            if s.startswith("[") and s.endswith("]"):
+                in_section = s == "[workspace.package]"
+                continue
+            if in_section and "=" in s and not s.startswith("#"):
+                existing.add(s.split("=")[0].strip())
+
+    missing = used_fields - existing
+    if not missing:
+        log(f"  Alle geerbten Felder bereits definiert ({len(existing)} Felder)")
+        return
+
+    # Fehlende Felder aus Defaults hinzufügen
+    to_add = {}
+    for field in missing:
+        if field in INHERITED_DEFAULTS:
+            to_add[field] = INHERITED_DEFAULTS[field]
+        else:
+            warn(f"  Unbekanntes geerbtes Feld: {field} – Default fehlt, wird übersprungen")
+
+    if not to_add:
+        return
+
+    if has_section:
+        # Felder in [workspace.package] einfügen (nach dem Header)
+        lines = text.splitlines()
+        insert_at = None
+        for i, line in enumerate(lines):
+            if line.strip() == "[workspace.package]":
+                insert_at = i + 1
+                break
+        if insert_at is None:
+            fail("wgpu-root: [workspace.package]-Header nicht gefunden")
+            return
+        for field, val in to_add.items():
+            lines.insert(insert_at, f"{field} = {val}")
+            insert_at += 1
+        new_text = "\n".join(lines) + "\n"
+    else:
+        # Kompletter [workspace.package]-Block neu
+        block = "\n[workspace.package]\n" + "\n".join(f"{k} = {v}" for k, v in to_add.items()) + "\n"
+        if "[workspace]" in text:
+            new_text = text.replace("[workspace]", "[workspace]" + block, 1)
+        else:
+            new_text = "[workspace]\n" + block + "\n" + text
+
+    if CHECK_ONLY:
+        log(f"  würde ergänzen: {sorted(to_add.keys())}")
+        return
+
+    wgpu_root_toml.write_text(new_text)
+    log(f"  ergänzt in [workspace.package]: {sorted(to_add.keys())}")
+
+
+def verify_wgpu_workspace():
+    log("== wgpu workspace.package verifizieren ==")
+    if not WGPU_ROOT.exists():
+        return
+    used = collect_used_inherited_fields()
+    if not used:
+        log("  OK (keine Vererbung)")
+        return
+    wgpu_root_toml = WGPU_ROOT / "Cargo.toml"
+    text = wgpu_root_toml.read_text()
+    # Parse definierte Felder
+    existing = set()
+    in_section = False
+    for line in text.splitlines():
+        s = line.strip()
+        if s.startswith("[") and s.endswith("]"):
+            in_section = s == "[workspace.package]"
+            continue
+        if in_section and "=" in s and not s.startswith("#"):
+            existing.add(s.split("=")[0].strip())
+    missing = used - existing
+    if missing:
+        for f in sorted(missing):
+            fail(f"  Feld '{f}' geerbt aber nicht definiert")
+    else:
+        log(f"  OK: alle {len(used)} geerbten Felder definiert")
+
+
+# ═════════════════════════════════════════════════════════════════════
+# 10. wgpu-hal adapter.rs: Mali-G31 SSBO-Fix
+# ═════════════════════════════════════════════════════════════════════
+def patch_wgpu_adapter():
+    log("== wgpu-hal adapter.rs (Mali-G31 SSBO-Fix) ==")
+    adapter = WGPU_HAL / "src" / "gles" / "adapter.rs"
+    if not adapter.exists():
+        warn(f"{adapter.relative_to(ROOT)} nicht gefunden – SSBO-Fix übersprungen")
+        return
+
+    text = adapter.read_text()
+    if "Mali-G31 R36S-Fix" in text:
+        log("  bereits gepatcht")
+        return
+
+    # Regex toleriert Whitespace/Newlines
+    pattern = re.compile(
+        r'let\s+max_storage_buffers_per_shader_stage\s*=\s*'
+        r'if\s+vertex_shader_storage_blocks\s*==\s*0\s*\{\s*'
+        r'fragment_shader_storage_blocks\s*\}\s*else\s*\{\s*'
+        r'vertex_shader_storage_blocks\s*\.\s*min\s*\(\s*fragment_shader_storage_blocks\s*\)\s*\}\s*;',
+        re.DOTALL,
+    )
+
+    replacement = (
+        "let max_storage_buffers_per_shader_stage = if vertex_shader_storage_blocks == 0 {\n"
+        "            if vertex_ssbo_false_zero {\n"
+        "                fragment_shader_storage_blocks\n"
+        "            } else {\n"
+        "                0 // Mali-G31 R36S-Fix\n"
+        "            }\n"
+        "        } else {\n"
+        "            vertex_shader_storage_blocks.min(fragment_shader_storage_blocks)\n"
+        "        };"
+    )
+
+    new_text, n = pattern.subn(replacement, text, count=1)
+    if n == 0:
+        fail("adapter.rs: Muster für max_storage_buffers_per_shader_stage nicht gefunden")
+        # Diagnose
+        for i, line in enumerate(text.splitlines(), 1):
+            if "max_storage_buffers_per_shader_stage" in line:
+                print(f"  Zeile {i}: {line!r}", file=sys.stderr)
+        return
+
+    if CHECK_ONLY:
+        log("  würde patchen")
+        return
+
+    adapter.write_text(new_text)
+    log("  gepatcht (Mali-G31 SSBO-Fix)")
+
+
+# ═════════════════════════════════════════════════════════════════════
 # Main
-# ─────────────────────────────────────────────────────────────────────
-
+# ═════════════════════════════════════════════════════════════════════
 def main():
     global CHECK_ONLY, FORCE
     p = argparse.ArgumentParser()
@@ -739,20 +910,21 @@ def main():
     prepare_fb0()
     prepare_headless()
     prepare_portmaster()
+    fix_wgpu_workspace()
+    verify_wgpu_workspace()
+    patch_wgpu_adapter()
 
     log("")
     log("== Zusammenfassung ==")
-    log(f"  Fehler:   {len(errors)}")
+    log(f"  Fehler:    {len(errors)}")
     log(f"  Warnungen: {len(warnings)}")
     for w in warnings:
         log(f"    W: {w}")
     for e in errors:
         log(f"    E: {e}")
 
-    if errors:
-        log("Abbruch wegen kritischer Fehler.")
-        return 1
-    return 0
+    return 1 if errors else 0
+
 
 if __name__ == "__main__":
     sys.exit(main())
