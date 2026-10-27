@@ -36,10 +36,11 @@ jobs:
       JOBS: "4"
       PORT_NAME: "skate3"
       MAX_GLIBC: "2.30"
-      # Cross-Compile: pkg-config erlauben, arm64-.pc-Dateien finden
       PKG_CONFIG_ALLOW_CROSS: "1"
       PKG_CONFIG_PATH: "/usr/lib/aarch64-linux-gnu/pkgconfig"
       PKG_CONFIG_SYSROOT_DIR: "/"
+      WGPU_TAG: "v27.0.4"
+      WGPU_HAL_VERSION: "27.0.4"
 
     steps:
       - name: Checkout
@@ -90,7 +91,7 @@ jobs:
           set -euo pipefail
           apt-get install -y --no-install-recommends \
             git python3 python3-pip python3-venv \
-            build-essential gcc-aarch64-linux-gnu g++-aarch64-linux-gnu \
+            build-essential cmake gcc-aarch64-linux-gnu g++-aarch64-linux-gnu \
             binutils-aarch64-linux-gnu pkg-config \
             file patchelf zip unzip imagemagick \
             libasound2-dev:arm64 libudev-dev:arm64 \
@@ -98,6 +99,7 @@ jobs:
             libegl-dev:arm64 libgles2-mesa-dev:arm64 \
             libwayland-dev:arm64 libxkbcommon-dev:arm64
           python3 --version
+          cmake --version
           pip3 install --no-cache-dir tomlkit
           python3 -c "import tomlkit; print('tomlkit', tomlkit.__version__)"
           git --version
@@ -112,20 +114,41 @@ jobs:
           echo "OK: tools/aarch64-prepare.py"
           python3 -c "import tomlkit" && echo "OK: tomlkit importierbar"
 
-      - name: wgpu v27.0.1 klonen
+      - name: wgpu ${{ env.WGPU_TAG }} klonen
         run: |
           set -euo pipefail
           rm -rf vendor/wgpu
-          git clone --depth 1 --branch v27.0.1 \
+          git clone --depth 1 --branch "$WGPU_TAG" \
             https://github.com/gfx-rs/wgpu.git vendor/wgpu
           test -f vendor/wgpu/wgpu-hal/src/gles/adapter.rs || { echo "::error::adapter.rs fehlt"; exit 1; }
           test -f vendor/wgpu/Cargo.toml || { echo "::error::wgpu/Cargo.toml fehlt"; exit 1; }
-          echo "OK: wgpu v27.0.1 geklont"
+          echo "== Versionen im geklonten Workspace =="
+          grep -nE '^version' vendor/wgpu/Cargo.toml | head -5 || true
+          grep -nE '^version' vendor/wgpu/wgpu-hal/Cargo.toml | head -5 || true
+          echo "OK: wgpu $WGPU_TAG geklont"
 
       - name: Prepare (alle Patches)
         run: |
           set -euo pipefail
           python3 tools/aarch64-prepare.py
+
+      - name: wgpu-hal-Version verifizieren
+        run: |
+          set -euo pipefail
+          HAL_TOML=vendor/wgpu/wgpu-hal/Cargo.toml
+          test -f "$HAL_TOML" || { echo "::error::$HAL_TOML fehlt"; exit 1; }
+          ACTUAL=$(grep -E '^version' "$HAL_TOML" | head -1 | sed -E 's/.*"(.*)".*/\1/' || true)
+          echo "Erwartet: $WGPU_HAL_VERSION"
+          echo "Tatsaechlich: ${ACTUAL:-<nicht gefunden>}"
+          if [ "$ACTUAL" != "$WGPU_HAL_VERSION" ]; then
+            echo "::error::wgpu-hal hat Version '$ACTUAL', erwartet '$WGPU_HAL_VERSION' — patch.crates-io greift sonst nicht"
+            echo "== Erste 30 Zeilen $HAL_TOML =="
+            head -30 "$HAL_TOML" || true
+            echo "== [workspace.package] in vendor/wgpu/Cargo.toml =="
+            sed -n '/^\[workspace.package\]/,/^\[/p' vendor/wgpu/Cargo.toml || true
+            exit 1
+          fi
+          echo "OK: wgpu-hal $WGPU_HAL_VERSION"
 
       - name: Verifikation nach Prepare
         run: |
@@ -143,7 +166,7 @@ jobs:
           echo "== app.rs-Kernpatches =="
           for marker in "primary_window: None" "Backends::GL" "Box::new(WgpuSettings" \
                         "disable::<bevy::winit::WinitPlugin>" "ScheduleRunnerPlugin" \
-                        "GpuPreprocessingSupport"; do
+                        "GpuPreprocessingSupport" "ExitCondition::DontExit"; do
             if grep -q "$marker" crates/skate-game/src/app.rs; then
               echo "  OK: $marker"
             else
@@ -152,6 +175,14 @@ jobs:
             fi
           done
           echo ""
+          echo "== app.rs: kein Some(Window ...) mehr =="
+          if grep -q 'primary_window: Some' crates/skate-game/src/app.rs; then
+            echo "  FEHLT: 'primary_window: Some' ist noch vorhanden"
+            grep -n 'primary_window' crates/skate-game/src/app.rs || true
+            exit 1
+          fi
+          echo "  OK"
+          echo ""
           echo "== wgpu-hal SSBO-Patch =="
           grep -q "Mali-G31 R36S-Fix" vendor/wgpu/wgpu-hal/src/gles/adapter.rs || exit 1
           echo "  OK"
@@ -159,6 +190,13 @@ jobs:
           echo "== skate-game default-features =="
           grep -q 'default = \[\]' crates/skate-game/Cargo.toml || exit 1
           echo "  OK"
+          echo ""
+          echo "== outline-atomics =="
+          if grep -qE 'target-feature=.*-outline-atomics' .cargo/config.toml; then
+            echo "  OK: -outline-atomics"
+          else
+            echo "::error::-outline-atomics fehlt in .cargo/config.toml"; exit 1
+          fi
 
       - name: Cargo Build
         run: |
