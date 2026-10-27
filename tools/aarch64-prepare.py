@@ -12,8 +12,11 @@ Wendet an:
   6. fb0_writer.rs (nur wenn fehlt)
   7. headless_plugin.rs (nur wenn fehlt)
   8. portmaster/ (nur wenn fehlt oder --force)
-  9. vendor/wgpu: [package]-Vererbung hart auflösen
+  9. vendor/wgpu: [package]-Vererbung hart auflösen (authors, edition, ...)
  10. vendor/wgpu: [dependencies]-Vererbung hart auflösen
+     - Form 1: dep.workspace = true
+     - Form 2: dep = { workspace = true, ... }
+     - Pfad-Dependencies werden relativ zum vendorten Crate korrekt gesetzt
  11. vendor/wgpu/wgpu-hal/src/gles/adapter.rs (Mali-G31 SSBO-Fix)
 
 Idempotent. Fehlschläge kritischer Patches → Exit 1.
@@ -281,7 +284,6 @@ def patch_app(text):
 
     # 5f. ScheduleRunnerPlugin nach dem DefaultPlugins-Block
     if "ScheduleRunnerPlugin" not in text:
-        # Suche app.add_plugins(DefaultPlugins ... ) und finde die schließende Klammer
         m = re.search(r'app\.add_plugins\s*\(\s*\n?\s*DefaultPlugins', text)
         if m:
             open_paren = text.find("(", m.start())
@@ -846,6 +848,7 @@ def resolve_package_inheritance():
 # 10. wgpu [dependencies]-Vererbung hart auflösen
 # ═════════════════════════════════════════════════════════════════════
 def parse_workspace_dependencies(root_text):
+    """Parst [workspace.dependencies]. Gibt dict dep_name -> roher TOML-Wert."""
     deps = {}
     in_section = False
     for line in root_text.splitlines():
@@ -864,6 +867,27 @@ def parse_workspace_dependencies(root_text):
     return deps
 
 
+def adjust_path_for_vendored(dep_value, vendored_crate_dir, wgpu_root):
+    """Passe path = "..." in dep_value so an, dass er relativ zum vendorten
+    Crate korrekt aufgelöst wird."""
+    m = re.search(r'path\s*=\s*"([^"]+)"', dep_value)
+    if not m:
+        return dep_value
+
+    original_path = m.group(1)
+    try:
+        abs_path = (wgpu_root / original_path).resolve()
+        rel_path = os.path.relpath(abs_path, vendored_crate_dir.resolve())
+    except (ValueError, OSError):
+        return dep_value
+
+    new_path = rel_path.replace(os.sep, "/")
+    if not new_path.startswith("."):
+        new_path = "./" + new_path
+
+    return dep_value[:m.start()] + f'path = "{new_path}"' + dep_value[m.end():]
+
+
 def resolve_dependency_inheritance():
     log("== wgpu [dependencies]-Vererbung hart auflösen ==")
     if not WGPU_ROOT.exists():
@@ -878,8 +902,14 @@ def resolve_dependency_inheritance():
     root_deps = parse_workspace_dependencies(root_toml.read_text())
     log(f"  Workspace-Dependencies: {len(root_deps)} Einträge")
 
-    pattern = re.compile(
+    # Form 1: dep.workspace = true (ganze Zeile)
+    pattern_dot = re.compile(
         r'^(\s*)([A-Za-z0-9_-]+)\.workspace\s*=\s*true\s*$',
+        re.MULTILINE,
+    )
+    # Form 2: dep = { workspace = true, ... }
+    pattern_inline = re.compile(
+        r'^(\s*)([A-Za-z0-9_-]+)\s*=\s*\{\s*workspace\s*=\s*true\s*,?\s*([^}]*)\}\s*$',
         re.MULTILINE,
     )
 
@@ -891,21 +921,55 @@ def resolve_dependency_inheritance():
         if cargo_toml == root_toml:
             continue
         text = cargo_toml.read_text()
+        vendored_crate_dir = cargo_toml.parent
 
-        def replace_line(m):
+        # ── Form 1: dep.workspace = true ────────────────────────────
+        def replace_dot(m):
             nonlocal total_fields, missing
             indent, dep = m.group(1), m.group(2)
             if dep not in root_deps:
                 missing.append((cargo_toml.relative_to(ROOT), dep))
                 return m.group(0)
+            val = adjust_path_for_vendored(root_deps[dep], vendored_crate_dir, WGPU_ROOT)
             total_fields += 1
-            return f"{indent}{dep} = {root_deps[dep]}"
+            return f"{indent}{dep} = {val}"
 
-        new_text, n = pattern.subn(replace_line, text)
-        if n > 0 and new_text != text:
+        text, n_dot = pattern_dot.subn(replace_dot, text)
+
+        # ── Form 2: dep = { workspace = true, ... } ─────────────────
+        def replace_inline(m):
+            nonlocal total_fields, missing
+            indent, dep, extra = m.group(1), m.group(2), m.group(3).strip()
+            if dep not in root_deps:
+                missing.append((cargo_toml.relative_to(ROOT), dep))
+                return m.group(0)
+            base = root_deps[dep]
+
+            if base.startswith("{") and base.endswith("}"):
+                inner = base[1:-1].strip()
+                inner = re.sub(r'\bworkspace\s*=\s*true\s*,?\s*', '', inner)
+                if extra:
+                    extra = extra.rstrip(",").strip()
+                    inner = inner + ", " + extra if inner else extra
+                val = "{ " + inner + " }"
+            else:
+                if extra:
+                    val = "{ version = " + base + ", " + extra.rstrip(",") + " }"
+                else:
+                    val = base
+
+            val = adjust_path_for_vendored(val, vendored_crate_dir, WGPU_ROOT)
+            total_fields += 1
+            return f"{indent}{dep} = {val}"
+
+        text, n_inline = pattern_inline.subn(replace_inline, text)
+
+        n_total = n_dot + n_inline
+        if n_total > 0:
             if not CHECK_ONLY:
-                cargo_toml.write_text(new_text)
-            log(f"  {cargo_toml.relative_to(ROOT)}: {n} Zeile(n) aufgelöst")
+                cargo_toml.write_text(text)
+            log(f"  {cargo_toml.relative_to(ROOT)}: {n_total} Zeile(n) aufgelöst "
+                f"(dot={n_dot}, inline={n_inline})")
             total_files += 1
 
     if missing:
@@ -923,22 +987,32 @@ def verify_dependency_inheritance():
         fail("wgpu-root Cargo.toml fehlt")
         return
     root_deps = parse_workspace_dependencies(root_toml.read_text())
-    pattern = re.compile(
+
+    pattern_dot = re.compile(
         r'^\s*([A-Za-z0-9_-]+)\.workspace\s*=\s*true\s*$',
         re.MULTILINE,
     )
+    pattern_inline = re.compile(
+        r'^\s*([A-Za-z0-9_-]+)\s*=\s*\{\s*workspace\s*=\s*true',
+        re.MULTILINE,
+    )
+
     bad = []
     for cargo_toml in sorted(WGPU_ROOT.rglob("Cargo.toml")):
         if cargo_toml == root_toml:
             continue
         text = cargo_toml.read_text()
-        for m in pattern.finditer(text):
+        for m in pattern_dot.finditer(text):
             dep = m.group(1)
             if dep in root_deps:
-                bad.append((cargo_toml.relative_to(ROOT), dep))
+                bad.append((cargo_toml.relative_to(ROOT), dep, "dot"))
+        for m in pattern_inline.finditer(text):
+            dep = m.group(1)
+            if dep in root_deps:
+                bad.append((cargo_toml.relative_to(ROOT), dep, "inline"))
     if bad:
-        for path, dep in bad:
-            fail(f"  {path}: '{dep}.workspace = true' noch vorhanden")
+        for path, dep, kind in bad:
+            fail(f"  {path}: '{dep}' ({kind}) noch nicht aufgelöst")
     else:
         log("  OK: keine Dependency-Vererbung mehr vorhanden")
 
