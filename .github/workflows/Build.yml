@@ -33,7 +33,7 @@ jobs:
       WGPU_SETTINGS_PRIO: "webgl2"
       RUST_BACKTRACE: "1"
       CARGO_TERM_COLOR: always
-      JOBS: "4"
+      JOBS: "2"
       PORT_NAME: "skate3"
       MAX_GLIBC: "2.30"
       PKG_CONFIG_ALLOW_CROSS: "1"
@@ -258,7 +258,8 @@ jobs:
           fi
           echo "  OK: keine .fetch_update( mehr"
 
-          # XinputCaps: entweder 0× (entfernt) oder >1× (in Nutzung). 1× heißt: nur use-Import
+          # XinputCaps: entweder 0× (entfernt) oder >1× (in Nutzung).
+          # Genau 1× = nur use-Import = unused = Fail
           PLATFORM_FILE=crates/skate-game/src/input/platform.rs
           if [ -f "$PLATFORM_FILE" ]; then
             XINPUT_COUNT=$(grep -c '\bXinputCaps\b' "$PLATFORM_FILE" 2>/dev/null || true)
@@ -269,6 +270,16 @@ jobs:
               exit 1
             fi
             echo "  OK: XinputCaps-Import bereinigt (count=$XINPUT_COUNT)"
+          fi
+
+          echo ""
+          echo "== skate-game [lints.rust] dead_code =="
+          if grep -q 'dead_code = "allow"' crates/skate-game/Cargo.toml; then
+            echo "  OK: dead_code = allow"
+          else
+            echo "  FEHLT: dead_code = allow in [lints.rust]"
+            grep -n 'lints' crates/skate-game/Cargo.toml || true
+            exit 1
           fi
 
           echo ""
@@ -310,11 +321,35 @@ jobs:
             exit 1
           fi
 
+      - name: Memory vor Build (Diagnose)
+        run: |
+          set -euo pipefail
+          free -m
+          df -h
+          nproc
+
       - name: Cargo Build
         run: |
           set -euo pipefail
           cargo build --release --target aarch64-unknown-linux-gnu \
             --workspace --jobs "$JOBS" 2>&1 | tee build.log
+
+      - name: Memory nach Build (Diagnose)
+        if: always()
+        run: |
+          set -euo pipefail
+          free -m || true
+
+      - name: OOM-Diagnose (nur bei Failure)
+        if: failure()
+        run: |
+          set -euo pipefail
+          echo "== dmesg (letzte 40 Zeilen) =="
+          dmesg 2>/dev/null | tail -40 || true
+          echo "== free =="
+          free -m || true
+          echo "== letzter build.log-Ausschnitt =="
+          tail -50 build.log || true
 
       - name: glibc pruefen
         run: |
