@@ -19,6 +19,8 @@ Wendet an:
  11. vendor/wgpu/wgpu-hal/Cargo.toml: naga mit termcolor-Feature
  12. vendor/wgpu/wgpu-hal/src/gles/adapter.rs (Mali-G31 SSBO-Fix)
  13. wgpu-hal Version verifizieren (27.0.4)
+ 14. crates/skate-game/src/input/platform.rs: unused XinputCaps-Import entfernen
+ 15. crates/**/*.rs: .fetch_update( → .try_update( (Rust 1.99 deprecated)
 
 Idempotent. Fehlschläge kritischer Patches → Exit 1.
 """
@@ -38,6 +40,7 @@ MAIN_RS     = GAME_SRC / "main.rs"
 APP_RS      = GAME_SRC / "app.rs"
 FB0_RS      = GAME_SRC / "fb0_writer.rs"
 HEADLESS_RS = GAME_SRC / "headless_plugin.rs"
+PLATFORM_RS = GAME_SRC / "input" / "platform.rs"
 PORTMASTER  = ROOT / "portmaster"
 CARGO_CFG   = ROOT / ".cargo" / "config.toml"
 WGPU_ROOT   = ROOT / "vendor" / "wgpu"
@@ -546,7 +549,7 @@ def prepare_fb0():
 # ═════════════════════════════════════════════════════════════════════
 # 7. headless_plugin.rs
 #
-# R36S-Bevy0.18-Fix      : On<E> statt Trigger<E>, add_observer statt add_systems
+# R36S-Bevy0.18-Fix        : On<E> statt Trigger<E>, add_observer statt add_systems
 # R36S-Bevy0.18-Option-Data: Image::data ist Option<Vec<u8>>; as_deref() benutzen
 # ═════════════════════════════════════════════════════════════════════
 HEADLESS_RS_FALLBACK = r'''//! Headless-Rendering -> /dev/fb0 via Screenshot-API (Bevy 0.18).
@@ -1262,6 +1265,82 @@ def verify_wgpu_hal_version(expected="27.0.4"):
 
 
 # ═════════════════════════════════════════════════════════════════════
+# 14. crates/skate-game/src/input/platform.rs: unused XinputCaps-Import
+# ═════════════════════════════════════════════════════════════════════
+def patch_platform_unused_import():
+    log("== crates/skate-game/src/input/platform.rs (unused XinputCaps) ==")
+    if not PLATFORM_RS.exists():
+        log("  nicht vorhanden – übersprungen")
+        return
+    text = PLATFORM_RS.read_text()
+
+    # Bereits gepatcht (kein XinputCaps mehr, ControllerKind-only-Import vorhanden)?
+    if ("use super::controller_kind::ControllerKind;" in text
+            and "XinputCaps" not in text):
+        log("  bereits gepatcht")
+        return
+
+    m = re.search(
+        r'use\s+super::controller_kind::\{\s*ControllerKind\s*,\s*XinputCaps\s*\}\s*;',
+        text,
+    )
+    if not m:
+        log("  Muster 'use super::controller_kind::{ControllerKind, XinputCaps};' nicht gefunden – nichts zu tun")
+        return
+
+    # Sicherheitsnetz: XinputCaps darf außerhalb der use-Zeile nicht referenziert werden
+    rest = text[:m.start()] + text[m.end():]
+    if re.search(r'\bXinputCaps\b', rest):
+        warn("input/platform.rs: XinputCaps wird außerhalb der use-Zeile referenziert – manueller Eingriff nötig")
+        return
+
+    new_text = (text[:m.start()]
+                + "use super::controller_kind::ControllerKind;"
+                + text[m.end():])
+    if CHECK_ONLY:
+        log("  würde patchen (XinputCaps-Import entfernen)")
+        return
+    PLATFORM_RS.write_text(new_text)
+    log("  gepatcht: XinputCaps-Import entfernt")
+
+
+# ═════════════════════════════════════════════════════════════════════
+# 15. crates/**/*.rs: .fetch_update( → .try_update( (Rust 1.99)
+# ═════════════════════════════════════════════════════════════════════
+def patch_fetch_update():
+    log("== crates/**/*.rs: .fetch_update( → .try_update( ==")
+    crates_dir = ROOT / "crates"
+    if not crates_dir.exists():
+        log("  crates/ nicht vorhanden – übersprungen")
+        return
+
+    total_files = 0
+    total_calls = 0
+    for rs in sorted(crates_dir.rglob("*.rs")):
+        try:
+            text = rs.read_text()
+        except (UnicodeDecodeError, OSError):
+            continue
+        if ".fetch_update" not in text:
+            continue
+        new_text, n = re.subn(r'\.fetch_update\s*\(', '.try_update(', text)
+        if n == 0:
+            continue
+        if CHECK_ONLY:
+            log(f"  würde patchen: {rs.relative_to(ROOT)} ({n}×)")
+        else:
+            rs.write_text(new_text)
+            log(f"  gepatcht: {rs.relative_to(ROOT)} ({n}×)")
+        total_files += 1
+        total_calls += n
+
+    if total_files == 0:
+        log("  keine .fetch_update(-Vorkommen gefunden")
+    else:
+        log(f"  {total_files} Datei(en), {total_calls} Aufruf(e) umgestellt")
+
+
+# ═════════════════════════════════════════════════════════════════════
 # Main
 # ═════════════════════════════════════════════════════════════════════
 def main():
@@ -1291,6 +1370,8 @@ def main():
     verify_dependency_inheritance()
     patch_wgpu_adapter()
     verify_wgpu_hal_version()
+    patch_platform_unused_import()
+    patch_fetch_update()
 
     log("")
     log("== Zusammenfassung ==")
