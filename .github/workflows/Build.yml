@@ -258,18 +258,36 @@ jobs:
           fi
           echo "  OK: keine .fetch_update( mehr"
 
-          # XinputCaps: entweder 0× (entfernt) oder >1× (in Nutzung).
-          # Genau 1× = nur use-Import = unused = Fail
+          # XinputCaps-Zustand prüfen.
+          #
+          # GÜLTIG:
+          #   (a) Import + echte Code-Nutzung    -> import=1 uses>=1
+          #   (b) Import + nur Kommentar-Nutzung -> import=1 uses>=1 (Warnung erlaubt, Compiler entscheidet)
+          #   (c) Weder Import noch Nutzung      -> import=0 uses=0
+          #
+          # FEHLER:
+          #   (d) Import vorhanden, aber NIRGENDS referenziert
+          #       -> Prepare hätte ihn entfernen sollen; hier fail.
+          #   (e) Import fehlt, aber Nutzung außerhalb Kommentar
+          #       -> Compiler fängt das als Fehler; hier nur WARNUNG,
+          #          damit ein Kommentar-Vorkommen keinen False Positive gibt.
           PLATFORM_FILE=crates/skate-game/src/input/platform.rs
           if [ -f "$PLATFORM_FILE" ]; then
-            XINPUT_COUNT=$(grep -c '\bXinputCaps\b' "$PLATFORM_FILE" 2>/dev/null || true)
-            XINPUT_COUNT=${XINPUT_COUNT:-0}
-            if [ "$XINPUT_COUNT" -eq 1 ]; then
-              echo "  FEHLER: XinputCaps-Import ist unused (nur 1 Vorkommen)"
+            XINPUT_TOTAL=$(grep -c '\bXinputCaps\b' "$PLATFORM_FILE" 2>/dev/null || true)
+            XINPUT_TOTAL=${XINPUT_TOTAL:-0}
+            XINPUT_IMPORT=$(grep -cE '^\s*use\s+.*\bXinputCaps\b' "$PLATFORM_FILE" 2>/dev/null || true)
+            XINPUT_IMPORT=${XINPUT_IMPORT:-0}
+            XINPUT_USES=$((XINPUT_TOTAL - XINPUT_IMPORT))
+            echo "  XinputCaps: total=$XINPUT_TOTAL import=$XINPUT_IMPORT uses=$XINPUT_USES"
+            if [ "$XINPUT_IMPORT" -gt 0 ] && [ "$XINPUT_USES" -eq 0 ]; then
+              echo "  FEHLER: XinputCaps-Import vorhanden, aber nirgends referenziert (unused import)"
               grep -n 'XinputCaps' "$PLATFORM_FILE" || true
               exit 1
             fi
-            echo "  OK: XinputCaps-Import bereinigt (count=$XINPUT_COUNT)"
+            if [ "$XINPUT_IMPORT" -eq 0 ] && [ "$XINPUT_USES" -gt 0 ]; then
+              echo "  WARNUNG: XinputCaps ohne use-Import — falls Nutzung außerhalb Kommentar, Compile-Fehler"
+            fi
+            echo "  OK: XinputCaps (import=$XINPUT_IMPORT uses=$XINPUT_USES)"
           fi
 
           echo ""
