@@ -5,14 +5,15 @@ aarch64-prepare.py — bereitet das Skate-3-Repo für RK3326/M9 Pro vor.
 Wendet an:
   1. .cargo/config.toml (Cross-Toolchain, Cortex-A35-Flags)
   2. Root-Cargo.toml (libc, wgpu-hal als Patch)
-  3. skate-game/Cargo.toml (libc.workspace)
+  3. skate-game/Cargo.toml (libc, default = [])
   4. main.rs (Module, WGPU-Env, HeadlessFbPlugin)
-  5. app.rs (Backends::GL, primary_window: None, winit-disable, GPU-Preproc)
+  5. app.rs (Backends::GL, primary_window: None, winit-disable,
+             ScheduleRunnerPlugin, GPU-Preproc)
   6. fb0_writer.rs (nur wenn fehlt)
   7. headless_plugin.rs (nur wenn fehlt)
   8. portmaster/ (nur wenn fehlt oder --force)
-  9. vendor/wgpu: [package]-Vererbung hart auflösen (authors, edition, ...)
- 10. vendor/wgpu: [dependencies]-Vererbung hart auflösen (arrayvec, naga, serde, ...)
+  9. vendor/wgpu: [package]-Vererbung hart auflösen
+ 10. vendor/wgpu: [dependencies]-Vererbung hart auflösen
  11. vendor/wgpu/wgpu-hal/src/gles/adapter.rs (Mali-G31 SSBO-Fix)
 
 Idempotent. Fehlschläge kritischer Patches → Exit 1.
@@ -151,7 +152,7 @@ def patch_root_cargo(text):
                 '[patch.crates-io]\nwgpu-hal = { path = "vendor/wgpu/wgpu-hal" }', 1)
             changed = True
         else:
-            warn("Root-Cargo.toml: [patch.crates-io] fehlt – wgpu-hal-Patch nicht aktiviert")
+            warn("Root-Cargo.toml: [patch.crates-io] fehlt")
     return text, changed
 
 def prepare_root_cargo():
@@ -165,14 +166,18 @@ def prepare_root_cargo():
 # 3. skate-game/Cargo.toml
 # ═════════════════════════════════════════════════════════════════════
 def patch_game_cargo(text):
-    if "libc.workspace" in text or 'libc = "0.2"' in text:
-        return text, False
-    if "[dependencies]" in text:
-        text = text.replace("[dependencies]",
-                            "[dependencies]\nlibc.workspace = true", 1)
-    else:
-        text += "\n[dependencies]\nlibc.workspace = true\n"
-    return text, True
+    changed = False
+    if "libc.workspace" not in text and 'libc = "0.2"' not in text:
+        if "[dependencies]" in text:
+            text = text.replace("[dependencies]",
+                                "[dependencies]\nlibc.workspace = true", 1)
+        else:
+            text += "\n[dependencies]\nlibc.workspace = true\n"
+        changed = True
+    if 'default = ["dev-dynamic"]' in text:
+        text = text.replace('default = ["dev-dynamic"]', 'default = []', 1)
+        changed = True
+    return text, changed
 
 def prepare_game_cargo():
     log("== skate-game/Cargo.toml ==")
@@ -194,7 +199,7 @@ def patch_main(text):
                 "mod trigger_volumes;\nmod fb0_writer;\nmod headless_plugin;", 1)
             changed = True
         else:
-            warn("main.rs: 'mod trigger_volumes;' fehlt – Module nicht eingefügt")
+            warn("main.rs: 'mod trigger_volumes;' fehlt")
 
     if 'std::env::set_var("WGPU_BACKEND"' not in text:
         if "fn main() -> bevy::app::AppExit {" in text:
@@ -214,7 +219,7 @@ def patch_main(text):
                 "    app.add_plugins(headless_plugin::HeadlessFbPlugin);", 1)
             changed = True
         else:
-            warn("main.rs: app::build(...)-Anker fehlt – Plugin nicht eingefügt")
+            warn("main.rs: app::build(...)-Anker fehlt")
 
     return text, changed
 
@@ -229,10 +234,12 @@ def prepare_main():
 def patch_app(text):
     changed = False
 
+    # 5a. Backends::VULKAN -> GL
     if "Backends::VULKAN" in text:
         text = text.replace("Backends::VULKAN", "Backends::GL", 1)
         changed = True
 
+    # 5b. RenderCreation::Automatic(WgpuSettings -> Box::new(...)
     marker = "RenderCreation::Automatic(WgpuSettings"
     if marker in text:
         idx = text.find(marker)
@@ -245,6 +252,7 @@ def patch_app(text):
                 text = new_text
                 changed = True
 
+    # 5c. primary_window: Some(...) -> None
     if "primary_window: Some" in text and "primary_window: None" not in text:
         idx = text.find("primary_window: Some")
         j = idx + len("primary_window: Some")
@@ -256,11 +264,13 @@ def patch_app(text):
                 text = text[:idx] + "primary_window: None" + text[close + 1:]
                 changed = True
 
+    # 5d. exit_condition: ExitCondition::DontExit
     if "primary_window: None" in text and "ExitCondition::DontExit" not in text:
         text = text.replace("primary_window: None",
             "primary_window: None,\n            exit_condition: ExitCondition::DontExit", 1)
         changed = True
 
+    # 5e. WinitPlugin deaktivieren
     if "disable::<WinitPlugin>" not in text and "disable::<bevy::winit::WinitPlugin>" not in text:
         if ".build()" in text:
             pos = text.find(".build()")
@@ -269,6 +279,30 @@ def patch_app(text):
         else:
             warn("app.rs: '.build()' fehlt – winit-disable nicht eingefügt")
 
+    # 5f. ScheduleRunnerPlugin nach dem DefaultPlugins-Block
+    if "ScheduleRunnerPlugin" not in text:
+        # Suche app.add_plugins(DefaultPlugins ... ) und finde die schließende Klammer
+        m = re.search(r'app\.add_plugins\s*\(\s*\n?\s*DefaultPlugins', text)
+        if m:
+            open_paren = text.find("(", m.start())
+            if open_paren >= 0:
+                close_paren = find_matching(text, open_paren, '(', ')')
+                if close_paren > 0:
+                    insert = (
+                        "\n    .add_plugins(bevy::app::ScheduleRunnerPlugin::run_loop(\n"
+                        "        std::time::Duration::from_secs_f64(1.0 / 30.0),\n"
+                        "    ))"
+                    )
+                    text = text[:close_paren + 1] + insert + text[close_paren + 1:]
+                    changed = True
+                else:
+                    warn("app.rs: DefaultPlugins-Klammer nicht geschlossen")
+            else:
+                warn("app.rs: DefaultPlugins-Öffnungsklammer nicht gefunden")
+        else:
+            warn("app.rs: 'app.add_plugins(DefaultPlugins' nicht gefunden")
+
+    # 5g. GpuPreprocessingSupport vor `app }`
     if "GpuPreprocessingSupport" not in text:
         idx = text.find("fn build")
         if idx >= 0:
