@@ -11,7 +11,7 @@ Wendet an:
   6. fb0_writer.rs (nur wenn fehlt)
   7. headless_plugin.rs (nur wenn fehlt)
   8. portmaster/ (nur wenn fehlt oder --force)
-  9. vendor/wgpu/Cargo.toml (fehlende [workspace.package]-Felder ergänzen)
+  9. vendor/wgpu: Vererbung in [package] hart auflösen (authors, edition, ...)
  10. vendor/wgpu/wgpu-hal/src/gles/adapter.rs (Mali-G31 SSBO-Fix)
 
 Idempotent. Fehlschläge kritischer Patches → Exit 1.
@@ -690,161 +690,160 @@ def prepare_portmaster():
 
 
 # ═════════════════════════════════════════════════════════════════════
-# 9. wgpu-Workspace-Vererbung fixen (nur [workspace.package]-Felder!)
+# 9. wgpu: [package]-Vererbung HART auflösen
 # ═════════════════════════════════════════════════════════════════════
-
-# Cargo erlaubt in [workspace.package] NUR diese Felder.
-# Dependencies wie `serde.workspace = true` gehören zu [workspace.dependencies]
-# und dürfen NICHT hier landen.
-CARGO_PACKAGE_INHERITABLE_FIELDS = {
+# Alle Felder, die Cargo in [workspace.package] erlaubt.
+PACKAGE_INHERITABLE = {
     "authors", "categories", "description", "documentation",
     "edition", "exclude", "homepage", "include", "keywords",
     "license", "license-file", "publish", "readme", "repository",
     "rust-version", "version",
 }
 
-# Sinnvolle Defaults für den wgpu-v27-Kontext.
-# Werte, die wgpu v27 typischerweise setzt bzw. die Cargo akzeptiert.
-INHERITED_DEFAULTS = {
+# Werte, die in wgpu v27.0.1 üblich sind (Fallback, falls im Root nicht gefunden).
+DEFAULTS = {
     "authors": '["gfx-rs developers"]',
-    "version": '"27.0.1"',
     "edition": '"2021"',
     "license": '"MIT OR Apache-2.0"',
     "repository": '"https://github.com/gfx-rs/wgpu"',
-    "rust-version": '"1.76"',
+    "version": '"27.0.1"',
+    "rust-version": '"1.82"',
     "homepage": '"https://wgpu.rs/"',
-    "description": '"Wgpu is a safe and portable graphics library for Rust"',
-    "readme": '"README.md"',
-    "documentation": '"https://docs.rs/wgpu"',
 }
 
 
-def collect_used_inherited_fields():
-    """Sammelt NUR Package-Felder, die in vendor/wgpu/**.Cargo.toml
-    per `.workspace = true` geerbt werden.
-
-    Filtert mit CARGO_PACKAGE_INHERITABLE_FIELDS, damit Dependency-Namen wie
-    `serde.workspace = true` (das ist [workspace.dependencies], nicht
-    [workspace.package]) NICHT fälschlich als fehlende Package-Felder landen.
-    """
-    used = set()
-    pattern = re.compile(r"^([A-Za-z0-9_-]+)\.workspace\s*=\s*true", re.MULTILINE)
-    for cargo_toml in WGPU_ROOT.rglob("Cargo.toml"):
-        if cargo_toml == WGPU_ROOT / "Cargo.toml":
-            continue
-        try:
-            text = cargo_toml.read_text()
-        except OSError:
-            continue
-        for match in pattern.finditer(text):
-            field = match.group(1)
-            if field in CARGO_PACKAGE_INHERITABLE_FIELDS:
-                used.add(field)
-    return used
-
-
-def parse_workspace_package_fields(text):
-    """Liefert Set der in [workspace.package] definierten Felder."""
-    existing = set()
+def parse_workspace_package(root_text):
+    """Liest [workspace.package]-Werte aus dem wgpu-Root-Manifest."""
+    values = {}
     in_section = False
-    for line in text.splitlines():
-        s = line.strip()
-        if s.startswith("[") and s.endswith("]"):
-            in_section = (s == "[workspace.package]")
+    for line in root_text.splitlines():
+        stripped = line.strip()
+        if stripped.startswith("[") and stripped.endswith("]"):
+            in_section = (stripped == "[workspace.package]")
             continue
-        if in_section and "=" in s and not s.startswith("#"):
-            existing.add(s.split("=", 1)[0].strip())
-    return existing
+        if not in_section or not stripped or stripped.startswith("#"):
+            continue
+        if "=" not in stripped:
+            continue
+        key, _, val = stripped.partition("=")
+        key = key.strip()
+        val = val.strip()
+        if key in PACKAGE_INHERITABLE:
+            values[key] = val
+    return values
 
 
-def fix_wgpu_workspace():
-    log("== wgpu workspace.package fixen ==")
+def resolve_package_inheritance():
+    """Ersetzt in jeder vendor/wgpu/**/Cargo.toml die [package]-Vererbung
+    (FELD.workspace = true) durch konkrete Werte. [dependencies]-Vererbung
+    bleibt unangetastet.
+    """
+    log("== wgpu [package]-Vererbung hart auflösen ==")
     if not WGPU_ROOT.exists():
         warn(f"{WGPU_ROOT.relative_to(ROOT)} fehlt – wgpu nicht geklont?")
         return
 
-    wgpu_root_toml = WGPU_ROOT / "Cargo.toml"
-    if not wgpu_root_toml.exists():
-        fail(f"{wgpu_root_toml.relative_to(ROOT)} fehlt")
+    root_toml = WGPU_ROOT / "Cargo.toml"
+    if not root_toml.exists():
+        fail(f"{root_toml.relative_to(ROOT)} fehlt")
         return
 
-    used_fields = collect_used_inherited_fields()
-    log(f"  Geerbte Package-Felder: {sorted(used_fields) or 'keine'}")
+    root_values = parse_workspace_package(root_toml.read_text())
+    # Fehlende Werte aus Defaults ergänzen
+    for key, val in DEFAULTS.items():
+        root_values.setdefault(key, val)
 
-    if not used_fields:
-        log("  Kein Handlungsbedarf")
-        return
+    # Root-Manifest selbst: fehlende Felder in [workspace.package] ergänzen,
+    # damit Cargo gar nicht erst meckert.
+    root_text = root_toml.read_text()
+    existing = parse_workspace_package(root_text)
+    missing_in_root = {k: v for k, v in root_values.items() if k not in existing}
 
-    text = wgpu_root_toml.read_text()
-    existing = parse_workspace_package_fields(text)
-    missing = used_fields - existing
-
-    if not missing:
-        log(f"  Alle {len(used_fields)} geerbten Felder bereits definiert")
-        return
-
-    to_add = {}
-    for field in sorted(missing):
-        if field in INHERITED_DEFAULTS:
-            to_add[field] = INHERITED_DEFAULTS[field]
+    if missing_in_root and "[workspace.package]" not in root_text:
+        block = "\n[workspace.package]\n" + "\n".join(
+            f"{k} = {v}" for k, v in missing_in_root.items()) + "\n"
+        if "[workspace]" in root_text:
+            root_text = root_text.replace("[workspace]", "[workspace]" + block, 1)
         else:
-            warn(f"  Feld '{field}' geerbt, aber kein Default bekannt – übersprungen")
-
-    if not to_add:
-        log("  Keine Felder mit bekanntem Default zum Ergänzen")
-        return
-
-    has_section = "[workspace.package]" in text
-    if has_section:
-        lines = text.splitlines()
+            root_text = "[workspace]\n" + block + "\n" + root_text
+        if not CHECK_ONLY:
+            root_toml.write_text(root_text)
+        log(f"  Root [workspace.package] ergänzt: {sorted(missing_in_root)}")
+    elif missing_in_root:
+        lines = root_text.splitlines()
         insert_at = None
         for i, line in enumerate(lines):
             if line.strip() == "[workspace.package]":
                 insert_at = i + 1
                 break
-        if insert_at is None:
-            fail("wgpu-root: [workspace.package]-Header nicht gefunden")
-            return
-        for field, val in to_add.items():
-            lines.insert(insert_at, f"{field} = {val}")
-            insert_at += 1
-        new_text = "\n".join(lines) + "\n"
-    else:
-        block = "\n[workspace.package]\n" + "\n".join(
-            f"{k} = {v}" for k, v in to_add.items()) + "\n"
-        if "[workspace]" in text:
-            new_text = text.replace("[workspace]", "[workspace]" + block, 1)
+        if insert_at is not None:
+            for k, v in missing_in_root.items():
+                lines.insert(insert_at, f"{k} = {v}")
+                insert_at += 1
+            root_text = "\n".join(lines) + "\n"
+            if not CHECK_ONLY:
+                root_toml.write_text(root_text)
+            log(f"  Root [workspace.package] ergänzt: {sorted(missing_in_root)}")
         else:
-            new_text = "[workspace]\n" + block + "\n" + text
+            warn("Root: [workspace.package]-Header nicht gefunden")
 
-    if CHECK_ONLY:
-        log(f"  würde ergänzen: {sorted(to_add.keys())}")
-        return
+    # Jetzt jede Cargo.toml unter vendor/wgpu (außer Root) durchgehen
+    pattern = re.compile(
+        r'^(\s*)([A-Za-z0-9_-]+)\.workspace\s*=\s*true\s*$',
+        re.MULTILINE,
+    )
 
-    wgpu_root_toml.write_text(new_text)
-    log(f"  ergänzt: {sorted(to_add.keys())}")
+    total_files = 0
+    total_fields = 0
+
+    for cargo_toml in sorted(WGPU_ROOT.rglob("Cargo.toml")):
+        if cargo_toml == root_toml:
+            continue
+        text = cargo_toml.read_text()
+
+        # Nur [package]-Sektion betrachten
+        # Einfacher: alle *.workspace = true-Zeilen, aber nur Felder aus PACKAGE_INHERITABLE
+        def replace_line(m):
+            nonlocal total_fields
+            indent, field = m.group(1), m.group(2)
+            if field not in PACKAGE_INHERITABLE:
+                return m.group(0)  # Dependency-Vererbung unangetastet
+            if field not in root_values:
+                warn(f"  {cargo_toml.relative_to(ROOT)}: Feld '{field}' geerbt, aber kein Wert bekannt")
+                return m.group(0)
+            total_fields += 1
+            return f"{indent}{field} = {root_values[field]}"
+
+        new_text, n = pattern.subn(replace_line, text)
+        if n > 0 and new_text != text:
+            if not CHECK_ONLY:
+                cargo_toml.write_text(new_text)
+            log(f"  {cargo_toml.relative_to(ROOT)}: {n} Zeile(n) aufgelöst")
+            total_files += 1
+
+    log(f"  {total_files} Datei(en), {total_fields} Feld(er) aufgelöst")
 
 
-def verify_wgpu_workspace():
-    log("== wgpu workspace.package verifizieren ==")
+def verify_package_inheritance():
+    """Prüft, dass keine [package]-Vererbung mehr in vendor/wgpu/**/Cargo.toml steht."""
+    log("== wgpu [package]-Vererbung verifizieren ==")
     if not WGPU_ROOT.exists():
         return
-    used = collect_used_inherited_fields()
-    if not used:
-        log("  OK (keine Vererbung)")
-        return
-    wgpu_root_toml = WGPU_ROOT / "Cargo.toml"
-    if not wgpu_root_toml.exists():
-        fail("wgpu-root Cargo.toml fehlt")
-        return
-    text = wgpu_root_toml.read_text()
-    existing = parse_workspace_package_fields(text)
-    missing = used - existing
-    if missing:
-        for f in sorted(missing):
-            fail(f"  Feld '{f}' geerbt aber nicht definiert")
+    pattern = re.compile(
+        r'^\s*([A-Za-z0-9_-]+)\.workspace\s*=\s*true\s*$',
+        re.MULTILINE,
+    )
+    bad = []
+    for cargo_toml in sorted(WGPU_ROOT.rglob("Cargo.toml")):
+        text = cargo_toml.read_text()
+        for m in pattern.finditer(text):
+            if m.group(1) in PACKAGE_INHERITABLE:
+                bad.append((cargo_toml.relative_to(ROOT), m.group(1)))
+    if bad:
+        for path, field in bad:
+            fail(f"  {path}: '{field}.workspace = true' noch vorhanden")
     else:
-        log(f"  OK: alle {len(used)} geerbten Package-Felder definiert")
+        log("  OK: keine [package]-Vererbung mehr vorhanden")
 
 
 # ═════════════════════════════════════════════════════════════════════
@@ -922,8 +921,8 @@ def main():
     prepare_fb0()
     prepare_headless()
     prepare_portmaster()
-    fix_wgpu_workspace()
-    verify_wgpu_workspace()
+    resolve_package_inheritance()
+    verify_package_inheritance()
     patch_wgpu_adapter()
 
     log("")
