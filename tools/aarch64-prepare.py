@@ -8,13 +8,15 @@ Wendet an:
   3. skate-game/Cargo.toml (libc, default = [])
   4. main.rs (Module, WGPU-Env, HeadlessFbPlugin)
   5. app.rs (Backends::GL, primary_window: None, winit-disable,
-             ScheduleRunnerPlugin, GPU-Preproc)
+             ScheduleRunnerPlugin, GPU-Preproc, ExitCondition)
   6. fb0_writer.rs (nur wenn fehlt)
   7. headless_plugin.rs (nur wenn fehlt)
   8. portmaster/ (nur wenn fehlt oder --force)
   9. vendor/wgpu: [package]-Vererbung hart auflösen
  10. vendor/wgpu: [dependencies]-Vererbung hart auflösen (via tomlkit)
- 11. vendor/wgpu/wgpu-hal/src/gles/adapter.rs (Mali-G31 SSBO-Fix)
+ 11. vendor/wgpu/wgpu-hal/Cargo.toml: naga mit termcolor-Feature
+ 12. vendor/wgpu/wgpu-hal/src/gles/adapter.rs (Mali-G31 SSBO-Fix)
+ 13. vendor/wgpu/wgpu-hal Version verifizieren (27.0.4)
 
 Idempotent. Fehlschläge kritischer Patches → Exit 1.
 """
@@ -281,10 +283,22 @@ def patch_app(text):
                 text = text[:idx] + "primary_window: None" + text[close + 1:]
                 changed = True
 
-    if "primary_window: None" in text and "ExitCondition::DontExit" not in text:
-        text = text.replace("primary_window: None",
-            "primary_window: None,\n            exit_condition: ExitCondition::DontExit", 1)
-        changed = True
+    # ExitCondition unabhängig vom primary_window-Zustand einfügen
+    if "ExitCondition::DontExit" not in text:
+        anchor = "primary_window: None"
+        idx = text.find(anchor)
+        if idx >= 0:
+            insert_at = idx + len(anchor)
+            j = insert_at
+            while j < len(text) and text[j] in ' \t\n':
+                j += 1
+            if j < len(text) and text[j] == ',':
+                text = text[:j+1] + "\n            exit_condition: ExitCondition::DontExit," + text[j+1:]
+            else:
+                text = text[:insert_at] + ",\n            exit_condition: ExitCondition::DontExit" + text[insert_at:]
+            changed = True
+        else:
+            warn("app.rs: 'primary_window: None' fehlt – exit_condition nicht eingefügt")
 
     if "disable::<WinitPlugin>" not in text and "disable::<bevy::winit::WinitPlugin>" not in text:
         if ".build()" in text:
@@ -751,7 +765,7 @@ DEFAULTS = {
     "edition": '"2021"',
     "license": '"MIT OR Apache-2.0"',
     "repository": '"https://github.com/gfx-rs/wgpu"',
-    "version": '"27.0.1"',
+    "version": '"27.0.4"',
     "rust-version": '"1.82"',
     "homepage": '"https://wgpu.rs/"',
 }
@@ -1084,6 +1098,104 @@ def patch_wgpu_adapter():
 
 
 # ═════════════════════════════════════════════════════════════════════
+# 12. wgpu-hal/Cargo.toml: naga mit termcolor-Feature
+# ═════════════════════════════════════════════════════════════════════
+def patch_wgpu_hal_naga():
+    log("== wgpu-hal naga termcolor-Feature ==")
+    hal_cargo = WGPU_HAL / "Cargo.toml"
+    if not hal_cargo.exists():
+        warn(f"{hal_cargo.relative_to(ROOT)} fehlt – naga-Feature nicht gepatcht")
+        return
+    text = hal_cargo.read_text()
+    old = "naga.workspace = true"
+    new = 'naga = { workspace = true, features = ["termcolor"] }'
+    if new in text:
+        log("  bereits gepatcht")
+        return
+    if old not in text:
+        # Prüfen, ob resolve_dependency_inheritance() bereits gelaufen ist
+        # und die Zeile schon aufgelöst hat.
+        if re.search(r'^naga\s*=\s*\{', text, re.MULTILINE):
+            log("  bereits aufgelöst (naga = { ... }) – Feature prüfen")
+            if "termcolor" in text:
+                log("  termcolor bereits vorhanden")
+                return
+            # Versuche, termcolor nachzurüsten (einfacher Fall)
+            def _add_termcolor(m):
+                inner = m.group(1)
+                if "features" in inner:
+                    if '"termcolor"' in inner or "'termcolor'" in inner:
+                        return m.group(0)
+                    return f"naga = {{ {inner.rstrip()}, features = {_append_feature(inner)} }}"
+                return f'naga = {{ {inner.rstrip()}, features = ["termcolor"] }}'
+            def _append_feature(inner):
+                mf = re.search(r'features\s*=\s*\[([^\]]*)\]', inner)
+                if mf:
+                    existing = mf.group(1).strip()
+                    if existing:
+                        return f'[{existing}, "termcolor"]'
+                    return '["termcolor"]'
+                return '["termcolor"]'
+            new_text, n = re.subn(r'^naga\s*=\s*\{([^}]*)\}', _add_termcolor, text, count=1, flags=re.MULTILINE)
+            if n > 0 and "termcolor" in new_text:
+                if not CHECK_ONLY:
+                    hal_cargo.write_text(new_text)
+                log("  termcolor-Feature nachgerüstet")
+                return
+            fail("wgpu-hal/Cargo.toml: naga-Zeile gefunden, aber termcolor konnte nicht ergänzt werden")
+            return
+        fail("wgpu-hal/Cargo.toml: 'naga.workspace = true' nicht gefunden")
+        return
+    if CHECK_ONLY:
+        log("  würde patchen")
+        return
+    hal_cargo.write_text(text.replace(old, new, 1))
+    log("  gepatcht: naga mit termcolor-Feature")
+
+
+# ═════════════════════════════════════════════════════════════════════
+# 13. wgpu-hal Version verifizieren
+# ═════════════════════════════════════════════════════════════════════
+def verify_wgpu_hal_version(expected="27.0.4"):
+    log("== wgpu-hal Version verifizieren ==")
+    hal_toml = WGPU_HAL / "Cargo.toml"
+    if not hal_toml.exists():
+        fail(f"{hal_toml.relative_to(ROOT)} fehlt")
+        return
+    text = hal_toml.read_text()
+    m = re.search(r'^version\s*=\s*"([^"]+)"', text, re.MULTILINE)
+    actual = None
+    if m:
+        actual = m.group(1)
+    elif "version.workspace = true" in text:
+        root_toml = WGPU_ROOT / "Cargo.toml"
+        if root_toml.exists():
+            root_text = root_toml.read_text()
+            m2 = re.search(
+                r'\[workspace\.package\][^\[]*?version\s*=\s*"([^"]+)"',
+                root_text, re.DOTALL,
+            )
+            if m2:
+                actual = m2.group(1)
+            else:
+                fail("wgpu-hal/Cargo.toml: version.workspace = true, "
+                     "aber [workspace.package].version nicht gefunden")
+                return
+        else:
+            fail(f"{root_toml.relative_to(ROOT)} fehlt")
+            return
+    else:
+        fail("wgpu-hal/Cargo.toml: kein version-Feld")
+        return
+
+    if actual != expected:
+        fail(f"wgpu-hal hat Version '{actual}', erwartet '{expected}' "
+             f"– [patch.crates-io] greift sonst nicht")
+    else:
+        log(f"  OK: wgpu-hal {actual}")
+
+
+# ═════════════════════════════════════════════════════════════════════
 # Main
 # ═════════════════════════════════════════════════════════════════════
 def main():
@@ -1107,10 +1219,14 @@ def main():
     prepare_fb0()
     prepare_headless()
     prepare_portmaster()
+    # naga termcolor MUSS vor resolve_dependency_inheritance() laufen,
+    # solange in wgpu-hal/Cargo.toml noch "naga.workspace = true" steht.
+    patch_wgpu_hal_naga()
     resolve_package_inheritance()
     resolve_dependency_inheritance()
     verify_dependency_inheritance()
     patch_wgpu_adapter()
+    verify_wgpu_hal_version()
 
     log("")
     log("== Zusammenfassung ==")
