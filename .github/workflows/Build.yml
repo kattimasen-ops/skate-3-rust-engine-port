@@ -36,6 +36,10 @@ jobs:
       JOBS: "4"
       PORT_NAME: "skate3"
       MAX_GLIBC: "2.30"
+      # Cross-Compile: pkg-config erlauben, arm64-.pc-Dateien finden
+      PKG_CONFIG_ALLOW_CROSS: "1"
+      PKG_CONFIG_PATH: "/usr/lib/aarch64-linux-gnu/pkgconfig"
+      PKG_CONFIG_SYSROOT_DIR: "/"
 
     steps:
       - name: Checkout
@@ -91,12 +95,15 @@ jobs:
             file patchelf zip unzip imagemagick \
             libasound2-dev:arm64 libudev-dev:arm64 \
             libdrm-dev:arm64 libgbm-dev:arm64 \
-            libegl-dev:arm64 libgles2-mesa-dev:arm64
+            libegl-dev:arm64 libgles2-mesa-dev:arm64 \
+            libwayland-dev:arm64 libxkbcommon-dev:arm64
           python3 --version
-          python3 -m pip --version || true
           pip3 install --no-cache-dir tomlkit
           python3 -c "import tomlkit; print('tomlkit', tomlkit.__version__)"
           git --version
+          echo "== Wayland pkg-config =="
+          pkg-config --exists wayland-client && echo "wayland-client OK" || echo "wayland-client FEHLT"
+          pkg-config --exists xkbcommon && echo "xkbcommon OK" || echo "xkbcommon FEHLT"
 
       - name: Prepare-Skript vorhanden?
         run: |
@@ -152,12 +159,6 @@ jobs:
           echo "== skate-game default-features =="
           grep -q 'default = \[\]' crates/skate-game/Cargo.toml || exit 1
           echo "  OK"
-          echo ""
-          echo "== wgpu [workspace.package] =="
-          grep -A20 '^\[workspace.package\]' vendor/wgpu/Cargo.toml | head -20 || true
-          echo ""
-          echo "== wgpu wgpu-hal dependencies (erste 20) =="
-          grep -A40 '^\[dependencies\]' vendor/wgpu/wgpu-hal/Cargo.toml | head -20 || true
 
       - name: Cargo Build
         run: |
