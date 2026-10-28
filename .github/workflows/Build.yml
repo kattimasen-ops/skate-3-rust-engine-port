@@ -360,11 +360,11 @@ jobs:
           df -h
           nproc
 
-      - name: Cargo.lock entfernen (verhindert doppelte wgpu-Versionen)
+      - name: Cargo.lock entfernen (verhindert doppelte wgpu/naga-Versionen)
         run: |
           set -euo pipefail
           if [ -f Cargo.lock ]; then
-            echo "Lösche Cargo.lock, damit [patch.crates-io] für alle wgpu-Crates greift"
+            echo "Lösche Cargo.lock, damit [patch.crates-io] für alle wgpu-Crates inkl. naga greift"
             rm -f Cargo.lock
           fi
 
