@@ -356,6 +356,14 @@ jobs:
           df -h
           nproc
 
+      - name: Cargo.lock neu auflösen (verhindert doppelte wgpu-Versionen)
+        run: |
+          set -euo pipefail
+          if [ -f Cargo.lock ]; then
+            echo "Lösche Cargo.lock, damit [patch.crates-io] für alle wgpu-Crates greift"
+            rm -f Cargo.lock
+          fi
+
       - name: Cargo Build
         run: |
           set -euo pipefail
