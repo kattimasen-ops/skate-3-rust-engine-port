@@ -3,8 +3,8 @@
 aarch64-prepare.py — bereitet das Skate-3-Repo für RK3326/M9 Pro vor.
 
 Wendet an:
-  1. .cargo/config.toml (Cross-Toolchain, Cortex-A35-Flags, Linker-Optimierung)
-  2. Root-Cargo.toml (libc; mimalloc; alle wgpu-* + naga als Pfad-Patches)
+  1. .cargo/config.toml
+  2. Root-Cargo.toml (libc, mimalloc, alle wgpu-* + naga als Pfad-Patches)
   3. skate-game/Cargo.toml (libc, mimalloc, crossbeam-channel, default = [],
                             [lints.rust] dead_code = "allow")
   4. main.rs (Module, WGPU-Env in unsafe-Block, HeadlessFbPlugin, exit-Cast,
@@ -13,16 +13,16 @@ Wendet an:
              winit-disable nach .build(), ScheduleRunnerPlugin,
              GpuPreprocessingSupport, kein Box)
   6. fb0_writer.rs (nur wenn fehlt)
-  7. headless_plugin.rs (Bevy-0.18-ImageCopy: Async Readback statt Screenshot)
-  8. portmaster/ (nur wenn fehlt oder --force, Auto-Generierung von input.cfg)
-  9. vendor/wgpu: [package]-Vererbung hart auflösen
- 10. vendor/wgpu: [dependencies]-Vererbung hart auflösen (via tomlkit)
+  7. headless_plugin.rs (Bevy-0.18-ImageCopy: Async Readback)
+  8. portmaster/ (Auto-Generierung von input.cfg)
+  9. vendor/wgpu: [package]-Vererbung auflösen
+ 10. vendor/wgpu: [dependencies]-Vererbung auflösen
  11. vendor/wgpu/wgpu-hal/Cargo.toml: naga mit termcolor-Feature
  12. vendor/wgpu/wgpu-hal/src/gles/adapter.rs (Mali-G31 SSBO-Fix)
  13. wgpu-hal Version verifizieren (27.0.4)
  14. crates/skate-game/src/input/platform.rs: unused XinputCaps-Import
- 15. crates/**/*.rs: .fetch_update( → .try_update( (Rust 1.99 deprecated)
- 16. Cargo.lock entfernen (erzwingt Neu-Auflösung der wgpu-Patches)
+ 15. crates/**/*.rs: .fetch_update( → .try_update(
+ 16. Cargo.lock entfernen (erzwingt Neu-Auflösung der Patches)
 
 Idempotent. Fehlschläge kritischer Patches → Exit 1.
 """
@@ -141,21 +141,14 @@ CARGO_CONFIG = """\
 [target.aarch64-unknown-linux-gnu]
 linker = "aarch64-linux-gnu-gcc"
 rustflags = [
-    # Performance & Cortex-A35
     "-C", "target-cpu=cortex-a35",
     "-C", "target-feature=-outline-atomics",
-    # LTO wird über Cargo.toml (profile.release) gesteuert
-    # Linker-Optimierung: tote Sektionen entfernen, nur benötigte Bibliotheken linken
     "-C", "link-arg=-Wl,--gc-sections",
     "-C", "link-arg=-Wl,--as-needed",
     "-C", "link-arg=-Wl,-O2",
     "-C", "link-arg=-Wl,--sort-common",
-    # libgcc statisch einbinden (glibc bleibt dynamisch für 2.30-Kompatibilität)
     "-C", "link-arg=-static-libgcc",
-    # Absicherung gegen Cross-Link-Probleme mit dynamischen Abhängigkeiten
-    # (wgpu lädt Mali/EGL/GLESv2 zur Laufzeit per dlopen; keine -lmali nötig)
     "-C", "link-arg=-Wl,--allow-shlib-undefined",
-    # panic=abort reduziert Unwind-Tabellen
     "-C", "panic=abort",
 ]
 
@@ -255,7 +248,6 @@ def patch_game_cargo(text):
             text += "\n[dependencies]\nmimalloc.workspace = true\n"
         changed = True
 
-    # crossbeam-channel für die ImageCopy-Pipeline (headless_plugin.rs)
     if "crossbeam-channel" not in text:
         if "[dependencies]" in text:
             text = text.replace(
@@ -937,7 +929,7 @@ OLD_HEADLESS_MARKERS = (
     "MessageReader<ScreenshotCaptured>",
     "Trigger<ScreenshotCaptured>",
     "R36S-Bevy0.18-Fix",
-    "R36S-Bevy0.18-Option-Data",  # Alte Screenshot-Version
+    "R36S-Bevy0.18-Option-Data",
 )
 
 
@@ -2009,14 +2001,15 @@ def patch_fetch_update():
 # ═════════════════════════════════════════════════════════════════════
 # 16. Cargo.lock entfernen
 #
-# Warum: Der vorhandene Cargo.lock hält wgpu 27.0.1 von crates.io fest.
-# Der Prepare-Skript patcht wgpu, wgpu-core, wgpu-types auf vendor/wgpu
-# (27.0.4), aber Cargo ignoriert den Patch, weil der Lock-File die
-# crates.io-Version festschreibt. Ergebnis: Zwei Versionen von wgpu-hal
-# im Graph → E0277 "trait not implemented for DynExposedAdapter" usw.
+# Warum: Der vorhandene Cargo.lock hält wgpu 27.0.1 und naga 27.0.3
+# von crates.io fest. Der Prepare-Skript patcht wgpu, wgpu-core,
+# wgpu-types und naga auf vendor/wgpu (27.0.4), aber Cargo ignoriert
+# die Patches, weil der Lock-File die crates.io-Versionen festschreibt.
+# Ergebnis: Zwei Versionen von wgpu-hal und naga im Graph → E0277/E0271
+# "trait not implemented" bzw. "type mismatch".
 #
 # Wenn Cargo.lock fehlt, löst Cargo die [patch.crates-io]-Sektionen
-# neu auf und nimmt alle wgpu-Crates aus vendor/wgpu.
+# neu auf und nimmt alle wgpu-Crates inkl. naga aus vendor/wgpu.
 # ═════════════════════════════════════════════════════════════════════
 def remove_cargo_lock():
     log("== Cargo.lock entfernen ==")
