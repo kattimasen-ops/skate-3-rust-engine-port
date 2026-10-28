@@ -24,6 +24,7 @@ Wendet an:
  14. crates/skate-game/src/input/platform.rs: unused XinputCaps-Import
      NUR entfernen, wenn keine echte Code-Nutzung mehr vorhanden
  15. crates/**/*.rs: .fetch_update( → .try_update( (Rust 1.99 deprecated)
+ 16. Cargo.lock entfernen (erzwingt Neu-Auflösung der wgpu-Patches)
 
 Idempotent. Fehlschläge kritischer Patches → Exit 1.
 """
@@ -260,13 +261,6 @@ def patch_game_cargo(text):
         text = text.replace('default = ["dev-dynamic"]', 'default = []', 1)
         changed = True
 
-    # [lints.rust] dead_code = "allow":
-    #   skate-game hat ~20 dead_code-Warnungen aus dem Engine-Code
-    #   (apt_vm/apt_scene/retail_menu_movies/input). Für einen Port
-    #   wollen wir den Build-Log lesbar halten — echte Bugs im
-    #   Port-Wrapper zeigen sich als compile errors, nicht als
-    #   dead_code-Warnungen. Leicht zu entfernen, wenn der Engine-Code
-    #   aufgeräumt wird.
     if "dead_code" not in text:
         if "[lints.rust]" not in text:
             text += '\n[lints.rust]\ndead_code = "allow"\n'
@@ -299,7 +293,6 @@ def patch_main(text):
         else:
             warn("main.rs: 'mod trigger_volumes;' fehlt")
 
-    # set_var in unsafe-Block (Edition 2024 / Rust 1.92+)
     if 'std::env::set_var("WGPU_BACKEND"' not in text:
         if "fn main() -> bevy::app::AppExit {" in text:
             text = text.replace("fn main() -> bevy::app::AppExit {",
@@ -347,18 +340,6 @@ def prepare_main():
 
 # ═════════════════════════════════════════════════════════════════════
 # 4b. main.rs: mimalloc als Global Allocator
-#
-# Marker: "mimalloc::MiMalloc"
-#
-# Warum: glibc malloc fragmentiert auf ARM64 mit vielen kleinen
-# Allocations (Bevy ECS, Assets, wgpu-Buffer) stark. mimalloc senkt
-# den Peak-RAM um 30-40 % und ist gleichzeitig schneller — kritisch
-# auf dem M9 Pro mit 376 MB verfügbarem RAM.
-#
-# Der Block muss NACH den mod-Deklarationen, aber VOR fn main stehen.
-# Er darf nicht innerhalb des unsafe-Blocks von patch_main() landen.
-# Deshalb wird er nach dem letzten "\n\n" vor "fn main()" eingefügt —
-# also an der obersten Modul-Ebene.
 # ═════════════════════════════════════════════════════════════════════
 def patch_main_allocator():
     log("== main.rs: mimalloc global_allocator ==")
@@ -840,33 +821,281 @@ GAMEINFO_XML = '''\
 '''
 
 LAUNCHER = r'''#!/bin/bash
-set -euo pipefail
-XDG_DATA_HOME=${XDG_DATA_HOME:-$HOME/.local/share}
+# Skate3.sh — Diagnose-Version mit vollem Logging und Timeouts.
+#
+# Ziel: Auf einem Gerät ohne SSH-Terminal diagnostizierbar sein.
+# - Jede Phase hat einen nummerierten Marker.
+# - Jeder potenziell hängende Befehl läuft mit `timeout -s KILL`.
+# - Ein Heartbeat-Subprozess schreibt alle 5 s "alive" in die Log-Datei.
+# - SKATE3_ASSETS wird gesetzt, damit die Engine die .pak-Dateien findet.
+#
+# Log: /roms/ports/skate3/log.txt
+# Crash-Reports: /roms/ports/skate3/report-*.txt
+
+set -uo pipefail  # KEIN -e — wir wollen weitermachen auch bei Fehlern
+
+# ═════════════════════════════════════════════════════════════════════
+# PHASE 0: Log SOFORT öffnen, BEVOR irgendetwas anderes passiert
+# ═════════════════════════════════════════════════════════════════════
+TS() { date '+%Y-%m-%d %H:%M:%S' 2>/dev/null || echo "?"; }
+
 SCRIPT_DIR="$(cd "$(dirname "$0")" 2>/dev/null && pwd)"
 GAMEDIR="$SCRIPT_DIR/skate3"
+
+LOG="$GAMEDIR/log.txt"
+if ! { [ -d "$GAMEDIR" ] && [ -w "$GAMEDIR" ]; }; then
+    LOG="/tmp/skate3-log.txt"
+fi
+
+if [ -f "$LOG" ] && [ "$(stat -c%s "$LOG" 2>/dev/null || echo 0)" -gt 1048576 ]; then
+    mv -f "$LOG" "$LOG.1" 2>/dev/null || true
+fi
+
+: > "$LOG"
+exec >> "$LOG" 2>&1
+
+printf '[%s] === Skate3 START (log=%s) ===\n' "$(TS)" "$LOG"
+sync 2>/dev/null || true
+
+log_count=0
+log() {
+    printf '[%s] %s\n' "$(TS)" "$*"
+    log_count=$((log_count + 1))
+    if [ "$log_count" -ge 10 ]; then
+        sync 2>/dev/null || true
+        log_count=0
+    fi
+}
+log_sync() {
+    printf '[%s] %s\n' "$(TS)" "$*"
+    sync 2>/dev/null || true
+}
+
+(
+    while true; do
+        sleep 5
+        printf '[%s] [heartbeat] alive\n' "$(TS)" >> "$LOG"
+        sync 2>/dev/null || true
+    done
+) &
+HEARTBEAT_PID=$!
+
+# ═════════════════════════════════════════════════════════════════════
+# Basis-Info
+# ═════════════════════════════════════════════════════════════════════
+log "SCRIPT_DIR=$SCRIPT_DIR"
+log "GAMEDIR=$GAMEDIR"
+log "LOG=$LOG"
+log "Kernel=$(uname -r 2>/dev/null || echo '?'), Arch=$(uname -m 2>/dev/null || echo '?')"
+log "PID=$$"
+log "MemAvailable: $(grep MemAvailable /proc/meminfo 2>/dev/null | awk '{print $2 "kB"}' || echo '?')"
+
 if [ ! -x "$GAMEDIR/skate3" ]; then
-    echo "FEHLER: $GAMEDIR/skate3 fehlt." >&2
+    log_sync "FEHLER: $GAMEDIR/skate3 fehlt oder nicht ausführbar"
+    kill "$HEARTBEAT_PID" 2>/dev/null || true
     exit 1
 fi
+log_sync "[ok] Binary $GAMEDIR/skate3 ist ausführbar"
+
+run_step() {
+    local tmo="$1"; shift
+    local label="$*"
+    log_sync "[start] $label (timeout ${tmo}s)"
+    local rc=0
+    if command -v timeout >/dev/null 2>&1; then
+        timeout -s KILL "$tmo" "$@" 2>&1
+        rc=$?
+    else
+        "$@" 2>&1
+        rc=$?
+    fi
+    if [ "$rc" -eq 124 ]; then
+        log_sync "[TIMEOUT] $label (${tmo}s) — übersprungen"
+    elif [ "$rc" -eq 0 ]; then
+        log "[ok] $label (rc=0)"
+    else
+        log "[fail] $label (rc=$rc)"
+    fi
+    return 0
+}
+
+run_step_q() {
+    local tmo="$1"; shift
+    local label="$*"
+    log_sync "[start] $label (timeout ${tmo}s)"
+    local rc=0
+    if command -v timeout >/dev/null 2>&1; then
+        timeout -s KILL "$tmo" "$@" >/dev/null 2>&1
+        rc=$?
+    else
+        "$@" >/dev/null 2>&1
+        rc=$?
+    fi
+    if [ "$rc" -eq 124 ]; then
+        log_sync "[TIMEOUT] $label (${tmo}s) — übersprungen"
+    elif [ "$rc" -eq 0 ]; then
+        log "[ok] $label"
+    else
+        log "[fail] $label (rc=$rc)"
+    fi
+    return 0
+}
+
+# ═════════════════════════════════════════════════════════════════════
+# PHASE 1: PortMaster control.txt
+# ═════════════════════════════════════════════════════════════════════
+log_sync ""
+log_sync "== [1/12] PortMaster control.txt =="
 controlfolder=""
-for candidate in "/opt/system/Tools/PortMaster" "/opt/tools/PortMaster" "$XDG_DATA_HOME/PortMaster" "/roms/ports/PortMaster" "/roms/tools/PortMaster"; do
+for candidate in "/opt/system/Tools/PortMaster" "/opt/tools/PortMaster" \
+                 "$HOME/.local/share/PortMaster" "/roms/ports/PortMaster" \
+                 "/roms/tools/PortMaster"; do
     if [ -d "$candidate" ]; then controlfolder="$candidate"; break; fi
 done
+log "controlfolder=$controlfolder"
+
 if [ -n "$controlfolder" ] && [ -f "$controlfolder/control.txt" ]; then
-    source "$controlfolder/control.txt" 2>/dev/null || true
-    if [ -f "${controlfolder}/mod_${CFW_NAME}.txt" ]; then
-        source "${controlfolder}/mod_${CFW_NAME}.txt" 2>/dev/null || true
+    PM_ENV="/tmp/pm-env.$$"
+    log_sync "[start] source $controlfolder/control.txt (subshell, timeout 5s)"
+    timeout -s KILL 5 bash -c "set -a; source '$controlfolder/control.txt' 2>/dev/null; set +a; env" > "$PM_ENV" 2>&1
+    SRC_RC=$?
+    if [ "$SRC_RC" -eq 124 ]; then
+        log_sync "[TIMEOUT] control.txt — fahre ohne fort"
+    elif [ -s "$PM_ENV" ]; then
+        for var in SDL_GAMECONTROLLERCONFIG sdl_controllerconfig CFW_NAME; do
+            val="$(grep "^$var=" "$PM_ENV" 2>/dev/null | head -1 | cut -d= -f2- || true)"
+            if [ -n "$val" ]; then
+                export "$var=$val"
+                log "  importiert: $var=$val"
+            fi
+        done
+        log "[ok] control.txt (env ausgelesen)"
+    else
+        log "[skip] control.txt (leer oder Fehler)"
     fi
+    rm -f "$PM_ENV"
+else
+    log "[skip] control.txt nicht gefunden"
 fi
+
+# ═════════════════════════════════════════════════════════════════════
+# PHASE 2: SDL-Umgebung
+# ═════════════════════════════════════════════════════════════════════
+log_sync ""
+log_sync "== [2/12] SDL-Umgebung =="
 export SDL_VIDEODRIVER="${SDL_VIDEODRIVER:-kmsdrm}"
-unset SDL_AUDIODRIVER AUDIODEV
-if [ -n "${sdl_controllerconfig:-}" ]; then
-    export SDL_GAMECONTROLLERCONFIG="$sdl_controllerconfig"
-fi
+export SDL_AUDIODRIVER=alsa
+unset AUDIODEV
+export SDL_AUDIO_SAMPLES="${SDL_AUDIO_SAMPLES:-2048}"
+
 if [ -n "${SDL_GAMECONTROLLERCONFIG:-}" ]; then
     export SDL_GAMECONTROLLERCONFIG_FILE="/tmp/skate3-gamecontrollerdb.txt"
     printf '%s\n' "$SDL_GAMECONTROLLERCONFIG" > "$SDL_GAMECONTROLLERCONFIG_FILE" 2>/dev/null || true
+    log "SDL_GAMECONTROLLERCONFIG_FILE gesetzt"
 fi
+
+# ═════════════════════════════════════════════════════════════════════
+# PHASE 3: ALSA-Mixer
+# ═════════════════════════════════════════════════════════════════════
+log_sync ""
+log_sync "== [3/12] ALSA-Mixer =="
+if command -v amixer >/dev/null 2>&1; then
+    for ctrl in Playback Master PCM Speaker Headphone DAC; do
+        run_step_q 3 amixer -c 0 sset "$ctrl" 100% unmute
+    done
+    run_step_q 3 amixer -c 0 cset numid=1 1
+fi
+
+# ═════════════════════════════════════════════════════════════════════
+# PHASE 4: .asoundrc
+# ═════════════════════════════════════════════════════════════════════
+log_sync ""
+log_sync "== [4/12] .asoundrc =="
+ASOUNDRC="$HOME/.asoundrc"
+if [ -f "$ASOUNDRC" ]; then
+    if ! grep -q 'type hw' "$ASOUNDRC" 2>/dev/null || \
+       ! grep -q 'card 0' "$ASOUNDRC" 2>/dev/null; then
+        mv -f "$ASOUNDRC" "$ASOUNDRC.skate3-backup" 2>/dev/null || rm -f "$ASOUNDRC"
+        log "Alte .asoundrc gesichert (nicht hw:0)"
+    fi
+fi
+
+# ═════════════════════════════════════════════════════════════════════
+# PHASE 5: CPU-Governor
+# ═════════════════════════════════════════════════════════════════════
+log_sync ""
+log_sync "== [5/12] CPU-Governor =="
+CPU_GOV_PATHS=()
+CPU_GOV_SAVED=()
+for c in /sys/devices/system/cpu/cpufreq/policy*/scaling_governor \
+         /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor; do
+    [ -f "$c" ] || continue
+    [ -w "$c" ] || continue
+    old="$(cat "$c" 2>/dev/null || echo '')"
+    CPU_GOV_PATHS+=("$c")
+    CPU_GOV_SAVED+=("$old")
+    timeout -s KILL 2 sh -c "echo performance > '$c'" 2>/dev/null || true
+done
+log "[done] CPU-Governor (${#CPU_GOV_PATHS[@]} Pfade)"
+
+# ═════════════════════════════════════════════════════════════════════
+# PHASE 6: GPU-Governor
+# ═════════════════════════════════════════════════════════════════════
+log_sync ""
+log_sync "== [6/12] GPU-Governor =="
+gpu_devfreq=""
+for candidate in /sys/class/devfreq/*.gpu /sys/class/devfreq/gpu; do
+    [ -d "$candidate" ] && gpu_devfreq="$candidate" && break
+done
+gpu_gov_saved=""
+gpu_min_saved=""
+if [ -n "$gpu_devfreq" ]; then
+    [ -r "$gpu_devfreq/governor" ] && gpu_gov_saved=$(cat "$gpu_devfreq/governor" 2>/dev/null || echo "")
+    [ -w "$gpu_devfreq/governor" ] && timeout -s KILL 2 sh -c "echo performance > '$gpu_devfreq/governor'" 2>/dev/null || true
+    if [ -r "$gpu_devfreq/available_frequencies" ] && [ -w "$gpu_devfreq/min_freq" ]; then
+        gpu_min_saved=$(cat "$gpu_devfreq/min_freq" 2>/dev/null || echo "")
+        max_freq=$(tr ' ' '\n' < "$gpu_devfreq/available_frequencies" 2>/dev/null | sort -n | tail -n 1 || echo "")
+        [ -n "$max_freq" ] && timeout -s KILL 2 sh -c "echo $max_freq > '$gpu_devfreq/min_freq'" 2>/dev/null || true
+    fi
+fi
+
+# ═════════════════════════════════════════════════════════════════════
+# PHASE 7: ZRAM
+# ═════════════════════════════════════════════════════════════════════
+log_sync ""
+log_sync "== [7/12] ZRAM =="
+if swapon --show 2>/dev/null | grep -q zram; then
+    log "[skip] ZRAM bereits aktiv"
+else
+    run_step_q 5 modprobe zram
+    if [ -e /dev/zram0 ]; then
+        grep -q lz4 /sys/block/zram0/comp_algorithm 2>/dev/null && \
+            run_step_q 2 sh -c 'echo lz4 > /sys/block/zram0/comp_algorithm'
+        run_step_q 2 sh -c 'echo 512M > /sys/block/zram0/disksize'
+        run_step_q 3 mkswap /dev/zram0
+        run_step_q 3 swapon /dev/zram0
+    fi
+fi
+
+# ═════════════════════════════════════════════════════════════════════
+# PHASE 8: DRI-RECHTE
+# ═════════════════════════════════════════════════════════════════════
+log_sync ""
+log_sync "== [8/12] DRI-Rechte =="
+for node in /dev/dri/card0 /dev/dri/renderD128 /dev/fb0; do
+    if [ -e "$node" ]; then
+        if [ ! -r "$node" ] || [ ! -w "$node" ]; then
+            run_step_q 2 sudo -n chmod 666 "$node"
+            run_step_q 2 chmod 666 "$node"
+        fi
+    fi
+done
+
+# ═════════════════════════════════════════════════════════════════════
+# PHASE 9: Mali-Libs (mit Cache-Check, um FAT32-Schreibzeit zu sparen)
+# ═════════════════════════════════════════════════════════════════════
+log_sync ""
+log_sync "== [9/12] Mali-Libs =="
 SYSTEM_MALI=""
 for candidate in \
     /usr/lib/aarch64-linux-gnu/libmali-bifrost-g31-rxp0-gbm.so \
@@ -877,18 +1106,68 @@ for candidate in \
     if [ -f "$candidate" ]; then SYSTEM_MALI="$candidate"; break; fi
 done
 if [ -n "$SYSTEM_MALI" ]; then
-    rm -rf /tmp/skate3-mali
-    mkdir -p /tmp/skate3-mali
-    for name in libmali.so.0 libmali.so.1 libmali.so libEGL.so.1 libEGL.so libGLESv2.so.2 libGLESv2.so; do
-        cp -f "$SYSTEM_MALI" "/tmp/skate3-mali/$name"
-    done
+    SKIP_MALI_COPY=0
+    if [ -d /tmp/skate3-mali ] && \
+       [ -f /tmp/skate3-mali/libmali.so ] && \
+       [ "$(stat -c%s /tmp/skate3-mali/libmali.so 2>/dev/null)" = "$(stat -c%s "$SYSTEM_MALI" 2>/dev/null)" ]; then
+        SKIP_MALI_COPY=1
+    fi
+    if [ "$SKIP_MALI_COPY" = "0" ]; then
+        rm -rf /tmp/skate3-mali
+        mkdir -p /tmp/skate3-mali
+        for name in libmali.so.0 libmali.so.1 libmali.so \
+                    libEGL.so.1 libEGL.so \
+                    libGLESv2.so.2 libGLESv2.so; do
+            cp -f "$SYSTEM_MALI" "/tmp/skate3-mali/$name" 2>/dev/null || true
+        done
+        log "Mali-Blob kopiert."
+    else
+        log "Mali-Blob bereits gecacht in /tmp."
+    fi
     export LD_LIBRARY_PATH="/tmp/skate3-mali:$GAMEDIR:/usr/lib/aarch64-linux-gnu:${LD_LIBRARY_PATH:-}"
 else
     export LD_LIBRARY_PATH="$GAMEDIR:/usr/lib/aarch64-linux-gnu:${LD_LIBRARY_PATH:-}"
+    log "WARN: kein Mali-Blob gefunden"
 fi
-# mimalloc als Global Allocator ist im Binary eingebaut, MALLOC_*-Variablen
-# werden von mimalloc ignoriert. Sie bleiben als Fallback, falls mimalloc
-# aus irgendeinem Grund deaktiviert wird.
+
+# ═════════════════════════════════════════════════════════════════════
+# PHASE 10: Restore-Handler + Env-Variablen
+# ═════════════════════════════════════════════════════════════════════
+log_sync ""
+log_sync "== [10/12] Restore-Handler =="
+restored=0
+restore() {
+    [ "$restored" = "1" ] && return 0
+    restored=1
+    for i in "${!CPU_GOV_PATHS[@]}"; do
+        old="${CPU_GOV_SAVED[$i]}"
+        if [ -n "$old" ]; then
+            timeout -s KILL 2 sh -c "echo '$old' > '${CPU_GOV_PATHS[$i]}'" 2>/dev/null || true
+        fi
+    done
+    if [ -n "$gpu_devfreq" ]; then
+        [ -n "$gpu_gov_saved" ] && timeout -s KILL 2 sh -c "echo '$gpu_gov_saved' > '$gpu_devfreq/governor'" 2>/dev/null || true
+        [ -n "$gpu_min_saved" ] && timeout -s KILL 2 sh -c "echo '$gpu_min_saved' > '$gpu_devfreq/min_freq'" 2>/dev/null || true
+    fi
+}
+cleanup_all() {
+    kill "$HEARTBEAT_PID" 2>/dev/null || true
+    if [ -n "${GPTOKEYB_PID:-}" ] && kill -0 "$GPTOKEYB_PID" 2>/dev/null; then
+        kill -TERM "$GPTOKEYB_PID" 2>/dev/null || true
+        sleep 0.3
+        kill -KILL "$GPTOKEYB_PID" 2>/dev/null || true
+    fi
+    restore
+    sync
+}
+trap cleanup_all EXIT INT TERM HUP
+
+# ═════════════════════════════════════════════════════════════════════
+# CRITICAL: SKATE3_ASSETS setzen!
+# ═════════════════════════════════════════════════════════════════════
+export SKATE3_ASSETS="$GAMEDIR/assets"
+log "SKATE3_ASSETS=$SKATE3_ASSETS"
+
 export MALLOC_TRIM_THRESHOLD_=131072
 export MALLOC_MMAP_THRESHOLD_=131072
 export MALLOC_ARENA_MAX=1
@@ -898,12 +1177,12 @@ export SKATE3_NO_VSYNC=1
 export SKATE3_NO_SHADOW=1
 export SKATE3_RENDER_WIDTH=448
 export SKATE3_RENDER_HEIGHT=336
-cpu_gov=""
-for c in /sys/devices/system/cpu/cpufreq/policy0/scaling_governor \
-         /sys/devices/system/cpu/cpu0/cpufreq/scaling_governor; do
-    if [ -w "$c" ]; then cpu_gov="$c"; break; fi
-done
-if [ -n "$cpu_gov" ]; then echo performance > "$cpu_gov" 2>/dev/null || true; fi
+
+# ═════════════════════════════════════════════════════════════════════
+# PHASE 11: gptokeyb
+# ═════════════════════════════════════════════════════════════════════
+log_sync ""
+log_sync "== [11/12] gptokeyb =="
 GPTOKEYB=""
 for c in "$controlfolder/gptokeyb" /opt/system/Tools/PortMaster/gptokeyb \
          /usr/local/bin/gptokeyb /usr/bin/gptokeyb; do
@@ -911,14 +1190,79 @@ for c in "$controlfolder/gptokeyb" /opt/system/Tools/PortMaster/gptokeyb \
 done
 GPTOKEYB_PID=""
 if [ -n "$GPTOKEYB" ]; then
-    "$GPTOKEYB" "$GAMEDIR/skate3" -k skate3 &
+    "$GPTOKEYB" "$GAMEDIR/skate3" -k skate3 >/dev/null 2>&1 &
     GPTOKEYB_PID=$!
+    log "gptokeyb gestartet (PID $GPTOKEYB_PID)"
 fi
-cd "$GAMEDIR"
+
+# ═════════════════════════════════════════════════════════════════════
+# PHASE 12: SKATE3 STARTEN
+# ═════════════════════════════════════════════════════════════════════
+log_sync ""
+log_sync "== [12/12] SKATE3 BINARY START =="
+log_sync "  MemAvailable vor Start: $(grep MemAvailable /proc/meminfo 2>/dev/null | awk '{print $2 "kB"}' || echo '?')"
+cd "$GAMEDIR" || { log_sync "FEHLER: cd $GAMEDIR"; exit 1; }
+
+STDOUT="$GAMEDIR/skate3-stdout.txt"
+STDERR="$GAMEDIR/skate3-stderr.txt"
+: > "$STDOUT"
+: > "$STDERR"
+
+log_sync "[start] ./skate3 --assets \"$GAMEDIR/assets\""
 STATUS=0
-./skate3 "$@" || STATUS=$?
-if [ -n "$GPTOKEYB_PID" ]; then kill -TERM "$GPTOKEYB_PID" 2>/dev/null || true; fi
-if [ -n "$cpu_gov" ]; then echo ondemand > "$cpu_gov" 2>/dev/null || true; fi
+./skate3 --assets "$GAMEDIR/assets" "$@" > "$STDOUT" 2> "$STDERR" &
+SKATE3_PID=$!
+log_sync "[pid] skate3 PID=$SKATE3_PID"
+wait "$SKATE3_PID" 2>/dev/null || STATUS=$?
+log_sync "[done] skate3 exited (rc=$STATUS)"
+
+if [ -n "$GPTOKEYB_PID" ] && kill -0 "$GPTOKEYB_PID" 2>/dev/null; then
+    kill -TERM "$GPTOKEYB_PID" 2>/dev/null || true
+    sleep 0.3
+    kill -KILL "$GPTOKEYB_PID" 2>/dev/null || true
+fi
+
+if [ "$STATUS" -gt 128 ]; then
+    SIG=$((STATUS - 128))
+    case "$SIG" in
+        4)  SIGNAME="SIGILL (falscher target-cpu?)" ;;
+        6)  SIGNAME="SIGABRT" ;;
+        7)  SIGNAME="SIGBUS" ;;
+        8)  SIGNAME="SIGFPE" ;;
+        9)  SIGNAME="SIGKILL (OOM-Killer?)" ;;
+        11) SIGNAME="SIGSEGV (Segfault)" ;;
+        15) SIGNAME="SIGTERM" ;;
+        *)  SIGNAME="Signal $SIG" ;;
+    esac
+    log_sync "  -> $SIGNAME"
+fi
+
+# ═════════════════════════════════════════════════════════════════════
+# CRASH-REPORT SICHERN
+# ═════════════════════════════════════════════════════════════════════
+if [ -d /tmp/Skate3RustEngine/CrashReports ]; then
+    cp -f /tmp/Skate3RustEngine/CrashReports/*.txt "$GAMEDIR/" 2>/dev/null || true
+    log "Crash-Report nach $GAMEDIR kopiert."
+fi
+
+log_sync ""
+log_sync "== skate3-stderr.txt (letzte 80 Zeilen) =="
+if [ -s "$STDERR" ]; then
+    tail -80 "$STDERR" | while IFS= read -r line; do log "  $line"; done
+else
+    log "  (leer)"
+fi
+log_sync ""
+log_sync "== skate3-stdout.txt (letzte 80 Zeilen) =="
+if [ -s "$STDOUT" ]; then
+    tail -80 "$STDOUT" | while IFS= read -r line; do log "  $line"; done
+else
+    log "  (leer)"
+fi
+
+log_sync ""
+log_sync "=== Skate3 ENDE (rc=$STATUS) ==="
+sync
 exit "$STATUS"
 '''
 
@@ -1367,21 +1711,6 @@ def verify_wgpu_hal_version(expected="27.0.4"):
 
 # ═════════════════════════════════════════════════════════════════════
 # 14. crates/skate-game/src/input/platform.rs: unused XinputCaps-Import
-#
-# WICHTIG:
-# - Der Import darf NUR entfernt werden, wenn XinputCaps nirgendwo sonst
-#   im File (außer der use-Zeile selbst) als echter Identifier vorkommt.
-# - Kommentare (//...) werden vor der Prüfung gestrippt, damit ein
-#   "// TODO: use XinputCaps" nicht fälschlich als Nutzung zählt.
-# - Wenn XinputCaps im Code verwendet wird (z.B. "let caps = XinputCaps {"),
-#   bleibt der Import unangetastet — sonst Compile-Fehler.
-#
-# Hinweis: In einem früheren Build meldete der Compiler "unused import:
-# XinputCaps" an Zeile 6, während auf Zeile 207 "let caps = XinputCaps {"
-# stand. Das kann bedeuten, dass XinputCaps dort ein lokales Struct im
-# selben Modul ist (also gar kein Import nötig). Dieser Patch entfernt
-# den Import in diesem Fall NICHT (Sicherheitsnetz greift), weil ein
-# Compile-Fehler schlimmer wäre als eine unused-import-Warnung.
 # ═════════════════════════════════════════════════════════════════════
 def patch_platform_unused_import():
     log("== crates/skate-game/src/input/platform.rs (unused XinputCaps) ==")
@@ -1410,7 +1739,6 @@ def patch_platform_unused_import():
             "nicht gefunden – nichts zu tun")
         return
 
-    # SICHERHEITSNETZ
     rest = text[:m.start()] + text[m.end():]
     rest_no_comments = re.sub(r'//[^\n]*', '', rest)
     if re.search(r'\bXinputCaps\b', rest_no_comments):
@@ -1465,6 +1793,31 @@ def patch_fetch_update():
 
 
 # ═════════════════════════════════════════════════════════════════════
+# 16. Cargo.lock entfernen
+#
+# Warum: Der vorhandene Cargo.lock hält wgpu 27.0.1 von crates.io fest.
+# Der Prepare-Skript patcht wgpu, wgpu-core, wgpu-types auf vendor/wgpu
+# (27.0.4), aber Cargo ignoriert den Patch, weil der Lock-File die
+# crates.io-Version festschreibt. Ergebnis: Zwei Versionen von wgpu-hal
+# im Graph → E0277 "trait not implemented for DynExposedAdapter" usw.
+#
+# Wenn Cargo.lock fehlt, löst Cargo die [patch.crates-io]-Sektionen
+# neu auf und nimmt alle wgpu-Crates aus vendor/wgpu.
+# ═════════════════════════════════════════════════════════════════════
+def remove_cargo_lock():
+    log("== Cargo.lock entfernen ==")
+    lock = ROOT / "Cargo.lock"
+    if not lock.exists():
+        log("  keine Cargo.lock vorhanden")
+        return
+    if CHECK_ONLY:
+        log("  würde löschen: Cargo.lock")
+        return
+    lock.unlink()
+    log("  gelöscht: Cargo.lock (wird von Cargo neu erzeugt)")
+
+
+# ═════════════════════════════════════════════════════════════════════
 # Main
 # ═════════════════════════════════════════════════════════════════════
 def main():
@@ -1497,6 +1850,7 @@ def main():
     verify_wgpu_hal_version()
     patch_platform_unused_import()
     patch_fetch_update()
+    remove_cargo_lock()
 
     log("")
     log("== Zusammenfassung ==")
