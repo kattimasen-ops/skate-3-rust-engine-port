@@ -5,7 +5,7 @@ aarch64-prepare.py — bereitet das Skate-3-Repo für RK3326/M9 Pro vor.
 Wendet an:
   1. .cargo/config.toml (Cross-Toolchain, Cortex-A35-Flags, Linker-Optimierung)
   2. Root-Cargo.toml (libc; mimalloc; alle wgpu-* + naga als Pfad-Patches)
-  3. skate-game/Cargo.toml (libc, mimalloc, default = [],
+  3. skate-game/Cargo.toml (libc, mimalloc, crossbeam-channel, default = [],
                             [lints.rust] dead_code = "allow")
   4. main.rs (Module, WGPU-Env in unsafe-Block, HeadlessFbPlugin, exit-Cast,
               mimalloc global_allocator)
@@ -13,16 +13,14 @@ Wendet an:
              winit-disable nach .build(), ScheduleRunnerPlugin,
              GpuPreprocessingSupport, kein Box)
   6. fb0_writer.rs (nur wenn fehlt)
-  7. headless_plugin.rs (Bevy-0.18-Fix: On statt Trigger, Observer,
-                          Image::data = Option<Vec<u8>>, init_resource<FbState>)
-  8. portmaster/ (nur wenn fehlt oder --force)
+  7. headless_plugin.rs (Bevy-0.18-ImageCopy: Async Readback statt Screenshot)
+  8. portmaster/ (nur wenn fehlt oder --force, Auto-Generierung von input.cfg)
   9. vendor/wgpu: [package]-Vererbung hart auflösen
  10. vendor/wgpu: [dependencies]-Vererbung hart auflösen (via tomlkit)
  11. vendor/wgpu/wgpu-hal/Cargo.toml: naga mit termcolor-Feature
  12. vendor/wgpu/wgpu-hal/src/gles/adapter.rs (Mali-G31 SSBO-Fix)
  13. wgpu-hal Version verifizieren (27.0.4)
  14. crates/skate-game/src/input/platform.rs: unused XinputCaps-Import
-     NUR entfernen, wenn keine echte Code-Nutzung mehr vorhanden
  15. crates/**/*.rs: .fetch_update( → .try_update( (Rust 1.99 deprecated)
  16. Cargo.lock entfernen (erzwingt Neu-Auflösung der wgpu-Patches)
 
@@ -255,6 +253,18 @@ def patch_game_cargo(text):
             )
         else:
             text += "\n[dependencies]\nmimalloc.workspace = true\n"
+        changed = True
+
+    # crossbeam-channel für die ImageCopy-Pipeline (headless_plugin.rs)
+    if "crossbeam-channel" not in text:
+        if "[dependencies]" in text:
+            text = text.replace(
+                "[dependencies]",
+                '[dependencies]\ncrossbeam-channel = "0.5"',
+                1,
+            )
+        else:
+            text += '\n[dependencies]\ncrossbeam-channel = "0.5"\n'
         changed = True
 
     if 'default = ["dev-dynamic"]' in text:
@@ -626,71 +636,122 @@ def prepare_fb0():
 
 
 # ═════════════════════════════════════════════════════════════════════
-# 7. headless_plugin.rs
-#
-# R36S-Bevy0.18-Fix        : On<E> statt Trigger<E>, add_observer statt add_systems
-# R36S-Bevy0.18-Option-Data: Image::data ist Option<Vec<u8>>; as_deref() benutzen
+# 7. headless_plugin.rs (ImageCopy-API)
 # ═════════════════════════════════════════════════════════════════════
-HEADLESS_RS_FALLBACK = r'''//! Headless-Rendering -> /dev/fb0 via Screenshot-API (Bevy 0.18).
+HEADLESS_RS_FALLBACK = r'''//! Headless-Rendering -> /dev/fb0 via ImageCopyPlugin (asynchroner Readback).
 //!
-//! R36S-Bevy0.18-Fix: On statt Trigger, Observer statt MessageReader.
-//! R36S-Bevy0.18-Option-Data: Image::data ist Option<Vec<u8>> – as_deref() benutzen.
+//! R36S-Bevy0.18-ImageCopy: Nutzt ImageCopyPlugin + persistenten Buffer
+//! + crossbeam-Channel statt ScreenshotPlugin (synchroner Readback = Stall).
 use bevy::prelude::*;
 use bevy::camera::{ImageRenderTarget, RenderTarget};
 use bevy::camera::visibility::RenderLayers;
 use bevy::render::view::NoIndirectDrawing;
 use bevy::render::render_resource::{
-    Extent3d, TextureDescriptor, TextureDimension, TextureFormat, TextureUsages,
+    Buffer, BufferDescriptor, BufferUsages, CommandEncoderDescriptor,
+    Extent3d, MapMode, PollType, TexelCopyBufferInfo, TexelCopyBufferLayout,
+    TextureDescriptor, TextureDimension, TextureFormat, TextureUsages,
 };
-use bevy::render::view::window::screenshot::{
-    Screenshot, ScreenshotCaptured, ScreenshotPlugin,
-};
+use bevy::render::renderer::RenderDevice;
+use bevy::render::render_asset::RenderAssets;
+use bevy::render::render_graph::{self, RenderGraph, RenderLabel};
+use bevy::render::texture::GpuImage;
+use bevy::render::{Extract, Render, RenderApp, RenderSystems};
 use bevy::ui::IsDefaultUiCamera;
 
+use crossbeam_channel::{Receiver, Sender};
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    Arc,
+};
+
 use crate::fb0_writer::Fb0Writer;
+
+const RENDER_WIDTH: u32 = 448;
+const RENDER_HEIGHT: u32 = 336;
 
 pub struct HeadlessFbPlugin;
 
 impl Plugin for HeadlessFbPlugin {
     fn build(&self, app: &mut App) {
-        app.add_plugins(ScreenshotPlugin)
+        let (tx, rx) = crossbeam_channel::unbounded();
+
+        let render_app = app.sub_app_mut(RenderApp);
+        render_app
+            .insert_resource(RenderWorldSender(tx))
+            .add_systems(ExtractSchedule, image_copy_extract)
+            .add_systems(
+                Render,
+                receive_image_from_buffer.after(RenderSystems::Render),
+            );
+
+        let mut render_graph = render_app.world_mut().resource_mut::<RenderGraph>();
+        render_graph.add_node(ImageCopy, ImageCopyDriver);
+        render_graph.add_node_edge(
+            ImageCopy,
+            bevy::render::graph::CameraDriverLabel,
+        );
+
+        app.insert_resource(MainWorldReceiver(rx))
             .init_resource::<FbState>()
             .add_systems(Startup, (clear_fb0, setup_offscreen).chain())
-            .add_systems(Update, request_screenshot)
-            .add_observer(copy_to_fb0);
+            .add_systems(PostUpdate, write_to_fb0);
     }
 }
 
 #[derive(Resource)]
-struct OffscreenTarget { handle: Handle<Image> }
+struct MainWorldReceiver(Receiver<Vec<u8>>);
+
+#[derive(Resource)]
+struct RenderWorldSender(Sender<Vec<u8>>);
+
+#[derive(Resource)]
+struct OffscreenTarget {
+    handle: Handle<Image>,
+}
 
 #[derive(Resource, Default)]
-struct FbState { writer: Option<Fb0Writer> }
+struct FbState {
+    writer: Option<Fb0Writer>,
+}
 
 fn clear_fb0(mut state: ResMut<FbState>) {
-    if let Ok(mut w) = Fb0Writer::open() { let _ = w.clear(); }
+    if let Ok(mut w) = Fb0Writer::open() {
+        let _ = w.clear();
+    }
     state.writer = Fb0Writer::open().ok();
 }
 
 fn setup_offscreen(
     mut commands: Commands,
     mut images: ResMut<Assets<Image>>,
-    state: ResMut<FbState>,
+    render_device: Res<RenderDevice>,
+    state: Res<FbState>,
 ) {
-    let size = Extent3d { width: 448, height: 336, depth_or_array_layers: 1 };
+    let size = Extent3d {
+        width: RENDER_WIDTH,
+        height: RENDER_HEIGHT,
+        depth_or_array_layers: 1,
+    };
+
     let mut image = Image {
         texture_descriptor: TextureDescriptor {
-            label: None, size, dimension: TextureDimension::D2,
+            label: Some("skate3_offscreen"),
+            size,
+            dimension: TextureDimension::D2,
             format: TextureFormat::Rgba8UnormSrgb,
-            mip_level_count: 1, sample_count: 1,
-            usage: TextureUsages::TEXTURE_BINDING | TextureUsages::COPY_DST
-                 | TextureUsages::COPY_SRC | TextureUsages::RENDER_ATTACHMENT,
+            mip_level_count: 1,
+            sample_count: 1,
+            usage: TextureUsages::TEXTURE_BINDING
+                | TextureUsages::COPY_DST
+                | TextureUsages::COPY_SRC
+                | TextureUsages::RENDER_ATTACHMENT,
             view_formats: &[],
         },
         ..default()
     };
     image.resize(size);
     let handle = images.add(image);
+
     commands.spawn((
         Camera3d::default(),
         RenderTarget::Image(ImageRenderTarget {
@@ -701,36 +762,182 @@ fn setup_offscreen(
         RenderLayers::default(),
         IsDefaultUiCamera,
     ));
-    commands.insert_resource(OffscreenTarget { handle });
+
+    commands.insert_resource(OffscreenTarget {
+        handle: handle.clone(),
+    });
+
+    commands.spawn(ImageCopier::new(handle, size, &render_device));
+
     if let Some(w) = &state.writer {
-        info!("fb0: {}x{}, {} bpp", w.width(), w.height(), w.bits_per_pixel());
+        info!(
+            "fb0: {}x{}, {} bpp (ImageCopyPlugin, async readback)",
+            w.width(),
+            w.height(),
+            w.bits_per_pixel()
+        );
     } else {
         warn!("fb0 konnte nicht geoeffnet werden");
     }
 }
 
-fn request_screenshot(
-    mut commands: Commands,
-    camera: Query<Entity, With<Camera3d>>,
-    target: Res<OffscreenTarget>,
-) {
-    if let Ok(entity) = camera.single() {
-        commands.entity(entity).insert(Screenshot::image(target.handle.clone()));
+fn write_to_fb0(mut state: ResMut<FbState>, receiver: Res<MainWorldReceiver>) {
+    let Some(writer) = state.writer.as_mut() else {
+        return;
+    };
+    while let Ok(data) = receiver.0.try_recv() {
+        let _ = writer.write_rgba8(&data, RENDER_WIDTH, RENDER_HEIGHT);
     }
 }
 
-fn copy_to_fb0(trigger: On<ScreenshotCaptured>, mut state: ResMut<FbState>) {
-    let msg = trigger.event();
-    let Some(writer) = state.writer.as_mut() else { return; };
-    let Some(data) = msg.image.data.as_deref() else { return; };
-    let _ = writer.write_rgba8(data, msg.image.width(), msg.image.height());
+#[derive(Clone, Default, Resource, Deref, DerefMut)]
+struct ImageCopiers(Vec<ImageCopier>);
+
+#[derive(Clone, Component)]
+struct ImageCopier {
+    buffer: Buffer,
+    enabled: Arc<AtomicBool>,
+    src_image: Handle<Image>,
+}
+
+impl ImageCopier {
+    fn new(src_image: Handle<Image>, size: Extent3d, render_device: &RenderDevice) -> Self {
+        let padded_bytes_per_row =
+            RenderDevice::align_copy_bytes_per_row(size.width as usize * 4);
+        let cpu_buffer = render_device.create_buffer(&BufferDescriptor {
+            label: Some("skate3_readback_buffer"),
+            size: padded_bytes_per_row as u64 * size.height as u64,
+            usage: BufferUsages::MAP_READ | BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        Self {
+            buffer: cpu_buffer,
+            enabled: Arc::new(AtomicBool::new(true)),
+            src_image,
+        }
+    }
+
+    fn enabled(&self) -> bool {
+        self.enabled.load(Ordering::Relaxed)
+    }
+}
+
+fn image_copy_extract(mut commands: Commands, image_copiers: Extract<Query<&ImageCopier>>) {
+    commands.insert_resource(ImageCopiers(
+        image_copiers.iter().cloned().collect::<Vec<_>>(),
+    ));
+}
+
+#[derive(Debug, PartialEq, Eq, Clone, Hash, RenderLabel)]
+struct ImageCopy;
+
+#[derive(Default)]
+struct ImageCopyDriver;
+
+impl render_graph::Node for ImageCopyDriver {
+    fn run(
+        &self,
+        _graph: &mut render_graph::RenderGraphContext,
+        render_context: &mut bevy::render::renderer::RenderContext,
+        world: &World,
+    ) -> Result<(), render_graph::NodeRunError> {
+        let Some(image_copiers) = world.get_resource::<ImageCopiers>() else {
+            return Ok(());
+        };
+        let Some(gpu_images) = world.get_resource::<RenderAssets<GpuImage>>() else {
+            return Ok(());
+        };
+
+        for image_copier in image_copiers.iter() {
+            if !image_copier.enabled() {
+                continue;
+            }
+            let Some(src_image) = gpu_images.get(&image_copier.src_image) else {
+                continue;
+            };
+
+            let mut encoder = render_context
+                .render_device()
+                .create_command_encoder(&CommandEncoderDescriptor {
+                    label: Some("skate3_image_copy_encoder"),
+                });
+
+            let block_dimensions = src_image.texture_format.block_dimensions();
+            let block_size = src_image
+                .texture_format
+                .block_copy_size(None)
+                .expect("texture format has no block copy size");
+
+            let padded_bytes_per_row = RenderDevice::align_copy_bytes_per_row(
+                (src_image.texture_descriptor.size.width as usize
+                    / block_dimensions.0 as usize)
+                    * block_size as usize,
+            );
+
+            encoder.copy_texture_to_buffer(
+                src_image.texture.as_image_copy(),
+                TexelCopyBufferInfo {
+                    buffer: &image_copier.buffer,
+                    layout: TexelCopyBufferLayout {
+                        offset: 0,
+                        bytes_per_row: std::num::NonZero::<u32>::new(
+                            padded_bytes_per_row as u32,
+                        )
+                        .map(Into::into),
+                        rows_per_image: None,
+                    },
+                },
+                src_image.texture_descriptor.size,
+            );
+
+            render_context.add_command_buffer(encoder.finish());
+        }
+        Ok(())
+    }
+}
+
+fn receive_image_from_buffer(
+    image_copiers: Option<Res<ImageCopiers>>,
+    render_device: Res<RenderDevice>,
+    sender: Res<RenderWorldSender>,
+) {
+    let Some(image_copiers) = image_copiers else {
+        return;
+    };
+    for image_copier in image_copiers.0.iter() {
+        if !image_copier.enabled() {
+            continue;
+        }
+        let buffer_slice = image_copier.buffer.slice(..);
+        let (tx, rx) = crossbeam_channel::bounded(1);
+
+        buffer_slice.map_async(MapMode::Read, move |result| {
+            let _ = tx.send(result);
+        });
+
+        let poll_result = render_device.poll(PollType::Wait);
+        if poll_result.is_err() {
+            let _ = rx.try_recv();
+            continue;
+        }
+
+        let Ok(Ok(())) = rx.recv() else {
+            continue;
+        };
+
+        let mapped = buffer_slice.get_mapped_range();
+        let _ = sender.send(mapped.to_vec());
+        drop(mapped);
+        image_copier.buffer.unmap();
+    }
 }
 '''
 
 OLD_HEADLESS_MARKERS = (
     "MessageReader<ScreenshotCaptured>",
     "Trigger<ScreenshotCaptured>",
-    "R36S-Bevy0.18-Fix",  # alte Version ohne Option-Data-Behandlung
+    "R36S-Bevy0.18-Fix",
+    "R36S-Bevy0.18-Option-Data",  # Alte Screenshot-Version
 )
 
 
@@ -739,15 +946,15 @@ def prepare_headless():
     if HEADLESS_RS.exists():
         old = HEADLESS_RS.read_text()
 
-        if "R36S-Bevy0.18-Option-Data" in old:
-            log("  bereits auf Bevy-0.18-API mit Option-Data gepatcht")
+        if "R36S-Bevy0.18-ImageCopy" in old:
+            log("  bereits auf ImageCopy-API gepatcht")
             return
 
         if any(m in old for m in OLD_HEADLESS_MARKERS):
-            log("  alte Screenshot-Version erkannt – ersetze durch Observer-Option-Version")
+            log("  alte Screenshot-Version erkannt – ersetze durch ImageCopy-Version")
             if not CHECK_ONLY:
                 HEADLESS_RS.write_text(HEADLESS_RS_FALLBACK)
-                log(f"  gepatcht: {HEADLESS_RS.relative_to(ROOT)} (R36S-Bevy0.18-Option-Data)")
+                log(f"  gepatcht: {HEADLESS_RS.relative_to(ROOT)} (R36S-Bevy0.18-ImageCopy)")
             else:
                 log("  würde patchen (CHECK_ONLY)")
             return
@@ -828,15 +1035,10 @@ LAUNCHER = r'''#!/bin/bash
 # - Jeder potenziell hängende Befehl läuft mit `timeout -s KILL`.
 # - Ein Heartbeat-Subprozess schreibt alle 5 s "alive" in die Log-Datei.
 # - SKATE3_ASSETS wird gesetzt, damit die Engine die .pak-Dateien findet.
-#
-# Log: /roms/ports/skate3/log.txt
-# Crash-Reports: /roms/ports/skate3/report-*.txt
+# - Erstellt automatisch input.cfg, falls sie fehlt (verhindert Crash).
 
 set -uo pipefail  # KEIN -e — wir wollen weitermachen auch bei Fehlern
 
-# ═════════════════════════════════════════════════════════════════════
-# PHASE 0: Log SOFORT öffnen, BEVOR irgendetwas anderes passiert
-# ═════════════════════════════════════════════════════════════════════
 TS() { date '+%Y-%m-%d %H:%M:%S' 2>/dev/null || echo "?"; }
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" 2>/dev/null && pwd)"
@@ -880,9 +1082,6 @@ log_sync() {
 ) &
 HEARTBEAT_PID=$!
 
-# ═════════════════════════════════════════════════════════════════════
-# Basis-Info
-# ═════════════════════════════════════════════════════════════════════
 log "SCRIPT_DIR=$SCRIPT_DIR"
 log "GAMEDIR=$GAMEDIR"
 log "LOG=$LOG"
@@ -941,9 +1140,6 @@ run_step_q() {
     return 0
 }
 
-# ═════════════════════════════════════════════════════════════════════
-# PHASE 1: PortMaster control.txt
-# ═════════════════════════════════════════════════════════════════════
 log_sync ""
 log_sync "== [1/12] PortMaster control.txt =="
 controlfolder=""
@@ -978,9 +1174,6 @@ else
     log "[skip] control.txt nicht gefunden"
 fi
 
-# ═════════════════════════════════════════════════════════════════════
-# PHASE 2: SDL-Umgebung
-# ═════════════════════════════════════════════════════════════════════
 log_sync ""
 log_sync "== [2/12] SDL-Umgebung =="
 export SDL_VIDEODRIVER="${SDL_VIDEODRIVER:-kmsdrm}"
@@ -994,9 +1187,6 @@ if [ -n "${SDL_GAMECONTROLLERCONFIG:-}" ]; then
     log "SDL_GAMECONTROLLERCONFIG_FILE gesetzt"
 fi
 
-# ═════════════════════════════════════════════════════════════════════
-# PHASE 3: ALSA-Mixer
-# ═════════════════════════════════════════════════════════════════════
 log_sync ""
 log_sync "== [3/12] ALSA-Mixer =="
 if command -v amixer >/dev/null 2>&1; then
@@ -1006,9 +1196,6 @@ if command -v amixer >/dev/null 2>&1; then
     run_step_q 3 amixer -c 0 cset numid=1 1
 fi
 
-# ═════════════════════════════════════════════════════════════════════
-# PHASE 4: .asoundrc
-# ═════════════════════════════════════════════════════════════════════
 log_sync ""
 log_sync "== [4/12] .asoundrc =="
 ASOUNDRC="$HOME/.asoundrc"
@@ -1020,9 +1207,6 @@ if [ -f "$ASOUNDRC" ]; then
     fi
 fi
 
-# ═════════════════════════════════════════════════════════════════════
-# PHASE 5: CPU-Governor
-# ═════════════════════════════════════════════════════════════════════
 log_sync ""
 log_sync "== [5/12] CPU-Governor =="
 CPU_GOV_PATHS=()
@@ -1038,9 +1222,6 @@ for c in /sys/devices/system/cpu/cpufreq/policy*/scaling_governor \
 done
 log "[done] CPU-Governor (${#CPU_GOV_PATHS[@]} Pfade)"
 
-# ═════════════════════════════════════════════════════════════════════
-# PHASE 6: GPU-Governor
-# ═════════════════════════════════════════════════════════════════════
 log_sync ""
 log_sync "== [6/12] GPU-Governor =="
 gpu_devfreq=""
@@ -1059,9 +1240,6 @@ if [ -n "$gpu_devfreq" ]; then
     fi
 fi
 
-# ═════════════════════════════════════════════════════════════════════
-# PHASE 7: ZRAM
-# ═════════════════════════════════════════════════════════════════════
 log_sync ""
 log_sync "== [7/12] ZRAM =="
 if swapon --show 2>/dev/null | grep -q zram; then
@@ -1077,9 +1255,6 @@ else
     fi
 fi
 
-# ═════════════════════════════════════════════════════════════════════
-# PHASE 8: DRI-RECHTE
-# ═════════════════════════════════════════════════════════════════════
 log_sync ""
 log_sync "== [8/12] DRI-Rechte =="
 for node in /dev/dri/card0 /dev/dri/renderD128 /dev/fb0; do
@@ -1091,9 +1266,6 @@ for node in /dev/dri/card0 /dev/dri/renderD128 /dev/fb0; do
     fi
 done
 
-# ═════════════════════════════════════════════════════════════════════
-# PHASE 9: Mali-Libs (mit Cache-Check, um FAT32-Schreibzeit zu sparen)
-# ═════════════════════════════════════════════════════════════════════
 log_sync ""
 log_sync "== [9/12] Mali-Libs =="
 SYSTEM_MALI=""
@@ -1130,9 +1302,6 @@ else
     log "WARN: kein Mali-Blob gefunden"
 fi
 
-# ═════════════════════════════════════════════════════════════════════
-# PHASE 10: Restore-Handler + Env-Variablen
-# ═════════════════════════════════════════════════════════════════════
 log_sync ""
 log_sync "== [10/12] Restore-Handler =="
 restored=0
@@ -1162,11 +1331,65 @@ cleanup_all() {
 }
 trap cleanup_all EXIT INT TERM HUP
 
-# ═════════════════════════════════════════════════════════════════════
-# CRITICAL: SKATE3_ASSETS setzen!
-# ═════════════════════════════════════════════════════════════════════
 export SKATE3_ASSETS="$GAMEDIR/assets"
 log "SKATE3_ASSETS=$SKATE3_ASSETS"
+
+CONFIG_DIR="$GAMEDIR/assets/private/stock/data/config"
+CONFIG_FILE="$CONFIG_DIR/input.cfg"
+
+if [ ! -f "$CONFIG_FILE" ]; then
+    log "Erstelle fehlende input.cfg in $CONFIG_DIR"
+    mkdir -p "$CONFIG_DIR"
+    cat > "$CONFIG_FILE" << 'EOF'
+// Skate 3 Stock Input Configuration
+DPadU = Button0;
+DPadD = Button1;
+DPadL = Button2;
+DPadR = Button3;
+Start = Button4;
+Back = Button5;
+LStick = Button6;
+RStick = Button7;
+LBumper = Button8;
+RBumper = Button9;
+LTrigger = Button10;
+RTrigger = Button11;
+A = Button12;
+B = Button13;
+X = Button14;
+Y = Button15;
+LStickR = Button16;
+LStickL = Button17;
+LStickU = Button18;
+LStickD = Button19;
+RStickR = Button20;
+RStickL = Button21;
+RStickU = Button22;
+RStickD = Button23;
+
+GP_LStickX = LStickR-LStickL;
+GP_LStickY = LStickU-LStickD;
+GP_LStickIn = LStick;
+GP_RStickX = RStickR-RStickL;
+GP_RStickY = RStickU-RStickD;
+GP_RStickIn = RStick;
+GP_LTrigger = LTrigger;
+GP_RTrigger = RTrigger;
+GP_LBumper = LBumper;
+GP_RBumper = RBumper;
+GP_UDPad = DPadU;
+GP_DDPad = DPadD;
+GP_LDPad = DPadL;
+GP_RDPad = DPadR;
+GP_XFace = X;
+GP_YFace = Y;
+GP_AFace = A;
+GP_BFace = B;
+EOF
+    log "input.cfg erfolgreich erstellt."
+else
+    log "input.cfg existiert bereits."
+fi
 
 export MALLOC_TRIM_THRESHOLD_=131072
 export MALLOC_MMAP_THRESHOLD_=131072
@@ -1178,9 +1401,6 @@ export SKATE3_NO_SHADOW=1
 export SKATE3_RENDER_WIDTH=448
 export SKATE3_RENDER_HEIGHT=336
 
-# ═════════════════════════════════════════════════════════════════════
-# PHASE 11: gptokeyb
-# ═════════════════════════════════════════════════════════════════════
 log_sync ""
 log_sync "== [11/12] gptokeyb =="
 GPTOKEYB=""
@@ -1195,9 +1415,6 @@ if [ -n "$GPTOKEYB" ]; then
     log "gptokeyb gestartet (PID $GPTOKEYB_PID)"
 fi
 
-# ═════════════════════════════════════════════════════════════════════
-# PHASE 12: SKATE3 STARTEN
-# ═════════════════════════════════════════════════════════════════════
 log_sync ""
 log_sync "== [12/12] SKATE3 BINARY START =="
 log_sync "  MemAvailable vor Start: $(grep MemAvailable /proc/meminfo 2>/dev/null | awk '{print $2 "kB"}' || echo '?')"
@@ -1237,9 +1454,6 @@ if [ "$STATUS" -gt 128 ]; then
     log_sync "  -> $SIGNAME"
 fi
 
-# ═════════════════════════════════════════════════════════════════════
-# CRASH-REPORT SICHERN
-# ═════════════════════════════════════════════════════════════════════
 if [ -d /tmp/Skate3RustEngine/CrashReports ]; then
     cp -f /tmp/Skate3RustEngine/CrashReports/*.txt "$GAMEDIR/" 2>/dev/null || true
     log "Crash-Report nach $GAMEDIR kopiert."
